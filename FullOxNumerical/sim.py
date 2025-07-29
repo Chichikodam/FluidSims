@@ -174,7 +174,7 @@ class systemComponent:
         self.u_iterate = None
 
     def record_to_arrays(self, pressure_history, temp_history, mdot_history, velocity_history, iteration):
-        """Efficiently record data to pre-allocated numpy arrays"""
+        """Efficiently record dat to pre-allocated numpy arrays"""
         if self.id is not None and iteration < pressure_history.shape[1]:
             pressure_history[self.id, iteration] = self.pressureIn if self.pressureIn is not None else 0
             temp_history[self.id, iteration] = self.temp if self.temp is not None else 0
@@ -379,8 +379,6 @@ if __name__ == "__main__":
 
     for i in range(timeIterations):
         feed_system.solve()
-        #print(f"Iteration {i+1}/{timeIterations} completed.")
-        # print progress every 1000 iterations
         if i > 0 and i % 1000 == 0:
             print(f"Progress: {i / timeIterations * 100:.5f}%")
     import matplotlib.pyplot as plt
@@ -396,12 +394,11 @@ if __name__ == "__main__":
     fig, axes = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
 
     for ax, idx, pos in zip(axes, idxs, positions):
-        cell: systemComponent
         cell = real_cells[idx]
         cell_id = cell.getID()
         
-        # Get data from pre-allocated arrays - much more efficient
-        cell_data = feed_system.get_cell_data(cell_id)
+        # Get data from pre-allocated arrays
+        cell_data = feed_system.get_cell_data(cell_id, up_to_iteration=feed_system.current_iteration)
         
         # build full time array
         t = np.arange(feed_system.current_iteration) * feed_system.dt
@@ -422,9 +419,7 @@ if __name__ == "__main__":
 
         ax.set_title(f'Cell at {pos} of feed system')
 
-    # common x‐label
     axes[-1].set_xlabel('Time (s)')
-
     plt.tight_layout()
     plt.show()
     print(dt)
