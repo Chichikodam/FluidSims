@@ -8,7 +8,7 @@ import time
 
 
 class FeedSystemCriticalPath:
-    def __init__(self, dt = 1, totalPipeLength=1.0,fluid: Fluid=None, N=2, extraComponents= [[None,None],[None,None]], mdot: float = None, inletPressure: float = None, outletPressure: float = None):
+    def __init__(self, dt = 1, totalPipeLength=1.0,fluid: Fluid=None, N=2, extraComponents= [[None,None],[None,None]], mdot: float = None, inletPressure: float = None, outletPressure: float = None, max_iterations=100000):
         self.N = N
         self.dL = totalPipeLength / N
         self.totalPipeLength = totalPipeLength
@@ -18,6 +18,15 @@ class FeedSystemCriticalPath:
         self.fluid = fluid
         self.mdot = mdot
         self.dt = dt
+        self.max_iterations = max_iterations
+        self.current_iteration = 0
+        
+        # Pre-allocate numpy arrays for all time history data
+        self.pressure_history = np.zeros((N + 2, max_iterations))  # +2 for ghost cells
+        self.temp_history = np.zeros((N + 2, max_iterations))
+        self.mdot_history = np.zeros((N + 2, max_iterations))
+        self.velocity_history = np.zeros((N + 2, max_iterations))
+        
         fluid.update(Input.temperature(-180), Input.pressure(inletPressure))  # Initial pressure in Pascals
         self.initTemp = fluid.temperature
         self.populate()
@@ -97,7 +106,35 @@ class FeedSystemCriticalPath:
             component: systemComponent
             component.solve(self.discretisedFeed[i-1].get_u_iterate(), self.discretisedFeed[i+1].getPressureIn(), self.dt)
             self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
+            # Record data efficiently using preallocation
+            component.record_to_arrays(self.pressure_history, self.temp_history, 
+                                     self.mdot_history, self.velocity_history, 
+                                     self.current_iteration)
             #print(f"Component {component.getID()}, {component.get_u_iterate()} m/s, {component.getPressureIn()/1e5} bar")
+        
+        self.current_iteration += 1
+
+    def get_cell_data(self, cell_id, up_to_iteration=None):
+        """Get time series data for a specific cell from pre-allocated arrays"""
+        if up_to_iteration is None:
+            up_to_iteration = self.current_iteration
+        
+        return {
+            'pressure': self.pressure_history[cell_id, :up_to_iteration],
+            'temperature': self.temp_history[cell_id, :up_to_iteration],
+            'mdot': self.mdot_history[cell_id, :up_to_iteration],
+            'velocity': self.velocity_history[cell_id, :up_to_iteration]
+        }
+
+    def get_final_snapshot(self):
+        """Get final state of all cells"""
+        final_iter = self.current_iteration - 1
+        return {
+            'pressure': self.pressure_history[:, final_iter],
+            'temperature': self.temp_history[:, final_iter],
+            'mdot': self.mdot_history[:, final_iter],
+            'velocity': self.velocity_history[:, final_iter]
+        }
 
 
     def upWinding(self, current, previous, next):
@@ -128,12 +165,21 @@ class systemComponent:
         self.rho = rho
         
         self.mdot = mdot
-        self.pressureThroughTime = [initP]
-        self.tempThroughTime = [initT]
-        self.mdotThroughTime = [initMdot]
+        # Keep legacy lists for backward compatibility, but use numpy arrays for performance
+        self.pressureThroughTime = [initP] if initP is not None else []
+        self.tempThroughTime = [initT] if initT is not None else []
+        self.mdotThroughTime = [initMdot] if initMdot is not None else []
         self.uIn = None
         self.uOut = None
         self.u_iterate = None
+
+    def record_to_arrays(self, pressure_history, temp_history, mdot_history, velocity_history, iteration):
+        """Efficiently record data to pre-allocated numpy arrays"""
+        if self.id is not None and iteration < pressure_history.shape[1]:
+            pressure_history[self.id, iteration] = self.pressureIn if self.pressureIn is not None else 0
+            temp_history[self.id, iteration] = self.temp if self.temp is not None else 0
+            mdot_history[self.id, iteration] = self.mdot if self.mdot is not None else 0
+            velocity_history[self.id, iteration] = self.u_iterate if self.u_iterate is not None else 0
 
     def getID(self):
         return self.id
@@ -294,11 +340,12 @@ class Pipe(systemComponent):
         self.u_iterate += dudt * dt
         #self.fluid = self.fluid.isentropic_compression_to_pressure(self.pressureIn)
         self.temp = self.fluid.temperature
-        self.record()
+        #self.record()
 
 
 
     def record(self):
+        # Keep backward compatibility with legacy lists
         self.pressureThroughTime.append(self.pressureIn)
         self.tempThroughTime.append(self.temp)
         self.mdotThroughTime.append(self.mdot)
@@ -314,10 +361,10 @@ if __name__ == "__main__":
     # Example usage
     fluid = Fluid(FluidsList.Oxygen)
     fluid.update(Input.temperature(-180), Input.pressure(barA(100)))
-    simTime = 10 #s
+    simTime = 5 #s
     timeIterations= 1000
     dt = simTime / timeIterations
-    feed_system = FeedSystemCriticalPath(dt = dt,totalPipeLength=1.0, fluid=fluid, N=10, mdot=1, inletPressure=barA(100), outletPressure=barA(50))
+    feed_system = FeedSystemCriticalPath(dt = dt,totalPipeLength=1.0, fluid=fluid, N=5, mdot=1, inletPressure=barA(100), outletPressure=barA(50), max_iterations=timeIterations+100)
 
     dL = feed_system.dL
     initial_velocity = feed_system.discretisedFeed[1].getVelocity()
@@ -335,7 +382,7 @@ if __name__ == "__main__":
         #print(f"Iteration {i+1}/{timeIterations} completed.")
         # print progress every 1000 iterations
         if i > 0 and i % 1000 == 0:
-            print(f"Progress: {i / timeIterations * 100:.0f}%")
+            print(f"Progress: {i / timeIterations * 100:.5f}%")
     import matplotlib.pyplot as plt
 
     # gather only the real cells (exclude ghost cells)
@@ -345,55 +392,21 @@ if __name__ == "__main__":
     idxs = [0, len(real_cells) // 2, len(real_cells) - 1]
     positions = ['start', 'middle', 'end']
 
-    # # gather final pressures and mass‐flow rates, filtering out None
-    # positions = []
-    # pressures = []
-    # mdots = []
-    # for cell in real_cells:
-    #     cell: systemComponent
-    #     p_last = cell.pressureThroughTime[-1]
-    #     m_last = cell.mdotThroughTime[-1]
-    #     if p_last is not None and m_last is not None:
-    #         positions.append(cell.getPos())#m
-    #         pressures.append(p_last / 1e5)   # convert to bar
-    #         mdots.append(m_last)
-    # print(dt)
-    # # plot on shared x‐axis, twin y‐axes
-    # fig, ax1 = plt.subplots(figsize=(8, 5))
-    # ax1.plot(positions, pressures, 'b-o', label='Pressure (bar)')
-    # ax1.set_xlabel('Position (m)')
-    # ax1.set_ylabel('Pressure (bar)', color='b')
-    # ax1.tick_params(axis='y', labelcolor='b')
-
-    # ax2 = ax1.twinx()
-    # ax2.plot(positions, mdots, 'r--s', label='Mass flow (kg/s)')
-    # ax2.set_ylabel('Mass flow (kg/s)', color='r')
-    # ax2.tick_params(axis='y', labelcolor='r')
-
-    # plt.title('Final Timestep: Pressure and Mass Flow Along Feed System')
-    # ax1.grid(True)
-    # fig.tight_layout()
-    # plt.show()
+    # Use optimized data access from pre-allocated arrays
     fig, axes = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
 
     for ax, idx, pos in zip(axes, idxs, positions):
         cell: systemComponent
         cell = real_cells[idx]
-        # build a time vector assuming constant dt
+        cell_id = cell.getID()
+        
+        # Get data from pre-allocated arrays - much more efficient
+        cell_data = feed_system.get_cell_data(cell_id)
         
         # build full time array
-        raw_time = np.arange(len(cell.pressureThroughTime)) * dt
-
-        # mask out any entries where pressure or mdot is None
-        mask = [
-            (p is not None and m is not None)
-            for p, m in zip(cell.pressureThroughTime, cell.mdotThroughTime)
-        ]
-
-        # apply mask
-        t = np.array([t for t, ok in zip(raw_time, mask) if ok])
-        p_bar = np.array([p for p, ok in zip(cell.pressureThroughTime, mask) if ok]) / 1e5
-        mdot = np.array([m for m, ok in zip(cell.mdotThroughTime, mask) if ok])
+        t = np.arange(feed_system.current_iteration) * feed_system.dt
+        p_bar = cell_data['pressure'] / 1e5
+        mdot = cell_data['mdot']
 
         # plot pressure
         ax.plot(t, p_bar, 'b-', label='Pressure (bar)')
