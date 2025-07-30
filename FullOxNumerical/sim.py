@@ -114,6 +114,67 @@ class FeedSystemCriticalPath:
         
         self.current_iteration += 1
 
+  def write_to_csv(self, pressure_filename="pressure_data.csv", massflow_filename="massflow_data.csv", output_dir="simulation_results"):
+        """
+        Write pressure and mass flow data to separate CSV files in a specified directory.
+        
+        Args:
+            pressure_filename (str): Name of the pressure CSV file
+            massflow_filename (str): Name of the mass flow CSV file
+            output_dir (str): Directory to save the files in
+        """
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Created directory: {output_dir}")
+        
+        # Full file paths
+        pressure_path = os.path.join(output_dir, pressure_filename)
+        massflow_path = os.path.join(output_dir, massflow_filename)
+        
+        # Get only real cells (exclude ghost cells)
+        real_cells = [c for c in self.discretisedFeed if c.type != 'g']
+        real_cell_ids = [c.getID() for c in real_cells]
+        
+        # Create time array
+        time_array = np.arange(self.current_iteration) * self.dt
+        
+        # Write pressure data
+        with open(pressure_path, 'w', newline='') as pressure_file:
+            writer = csv.writer(pressure_file)
+            
+            # Write header
+            header = ['Time (s)'] + [f'Cell_{cell_id}_Pressure (Pa)' for cell_id in real_cell_ids]
+            writer.writerow(header)
+            
+            # Write data row by row
+            for i in range(self.current_iteration):
+                row = [time_array[i]]
+                for cell_id in real_cell_ids:
+                    row.append(self.pressure_history[cell_id, i])
+                writer.writerow(row)
+        
+        # Write mass flow data
+        with open(massflow_path, 'w', newline='') as massflow_file:
+            writer = csv.writer(massflow_file)
+            
+            # Write header
+            header = ['Time (s)'] + [f'Cell_{cell_id}_Massflow (kg/s)' for cell_id in real_cell_ids]
+            writer.writerow(header)
+            
+            # Write data row by row
+            for i in range(self.current_iteration):
+                row = [time_array[i]]
+                for cell_id in real_cell_ids:
+                    row.append(self.mdot_history[cell_id, i])
+                writer.writerow(row)
+        
+        print(f"Data written to:")
+        print(f"  Pressure: {pressure_path}")
+        print(f"  Mass flow: {massflow_path}")
+        print(f"Data shape: {self.current_iteration} time steps x {len(real_cell_ids)} cells")
+
+
     def get_cell_data(self, cell_id, up_to_iteration=None):
         """Get time series data for a specific cell from pre-allocated arrays"""
         if up_to_iteration is None:
@@ -381,6 +442,18 @@ if __name__ == "__main__":
         feed_system.solve()
         if i > 0 and i % 1000 == 0:
             print(f"Progress: {i / timeIterations * 100:.5f}%")
+
+    
+    output_folder = f"simulation_results_{timestamp}"
+    
+    # Write CSV files to the new folder
+    feed_system.write_to_csv(
+        pressure_filename="pressure_results.csv", 
+        massflow_filename="massflow_results.csv",
+        output_dir=output_folder
+    )        
+    
+
     import matplotlib.pyplot as plt
 
     # gather only the real cells (exclude ghost cells)
