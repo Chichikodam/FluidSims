@@ -5,7 +5,8 @@ from thermo.chemical import Chemical
 import numpy as np
 from os import system 
 import time
-
+import os
+import csv
 
 class FeedSystemCriticalPath:
     def __init__(self, dt = 1, totalPipeLength=1.0,fluid: Fluid=None, N=2, extraComponents= [[None,None],[None,None]], mdot: float = None, inletPressure: float = None, outletPressure: float = None, max_iterations=100000):
@@ -30,6 +31,14 @@ class FeedSystemCriticalPath:
         fluid.update(Input.temperature(-180), Input.pressure(inletPressure))  # Initial pressure in Pascals
         self.initTemp = fluid.temperature
         self.populate()
+
+    def setMaxIterations(self, max_iterations):
+        self.max_iterations = max_iterations
+        self.pressure_history = np.zeros((self.N + 2, max_iterations))  # +2 for ghost cells
+        self.temp_history = np.zeros((self.N + 2, max_iterations))
+        self.mdot_history = np.zeros((self.N + 2, max_iterations))
+        self.velocity_history = np.zeros((self.N + 2, max_iterations))
+
     def discretise(self):
         self.discretisedFeed = []
         # scale and round extra component positions to the discretisation index
@@ -52,7 +61,7 @@ class FeedSystemCriticalPath:
                 pass
             else:
                 count += 1
-                pipe = Pipe(fluid=self.fluid, length=self.dL, mdot=self.mdot, pos=pos, location=i+1,  temp=self.initTemp, diameter=0.01)
+                pipe = Pipe(fluid=self.fluid, length=self.dL,pos=pos, location=i+1,  temp=self.initTemp, diameter=0.01)
             self.discretisedFeed.append(pipe)
 
     def populate(self):
@@ -60,6 +69,7 @@ class FeedSystemCriticalPath:
         currentPressure = self.inletPressure
         prevComponent = None
         self.discretise()
+        self.solveMdot(self.inletPressure, self.outletPressure)
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "p":
                 dp = component.dp(currentPressure, self.mdot)
@@ -75,7 +85,21 @@ class FeedSystemCriticalPath:
         self.discretisedFeed.insert(0, ghostCell(location=0, u=self.discretisedFeed[0].getVelocity(), pos=0, pressureIn=self.inletPressure, pressureOut=self.outletPressure, mdot=self.mdot, temp=self.initTemp))
         self.discretisedFeed.append(ghostCell(location=self.N, prevComp=self.discretisedFeed[-1], u=0, pos=self.totalPipeLength, pressureIn=self.inletPressure, pressureOut=self.outletPressure, mdot=self.mdot))
         self.boundaryPopulation()
+    def getSystemDP(self, mdot):
+        comp: systemComponent
+        # Implement the function to calculate the system pressure drop based on mdot
+        return sum(comp.dp(mdot=mdot, pressureIn=self.inletPressure) for comp in self.discretisedFeed if comp.type != "g")
 
+    def solveMdot(self, inletPressure: Optional[float] = None, outletPressure: Optional[float] = None):
+        self.mdot = None
+        dpTarget = inletPressure - outletPressure
+        def dpFunc(mdot):
+            # Implement the function to calculate dp based on mdot
+            return self.getSystemDP(mdot) - dpTarget
+        # Use root_scalar to find the mdot that gives the desired dp
+        result = root_scalar(dpFunc, bracket=[0.001, 10], method='bisect')
+        self.mdot = result.root
+        
 
     def boundaryPopulation(self):
         component: systemComponent
@@ -114,7 +138,7 @@ class FeedSystemCriticalPath:
         
         self.current_iteration += 1
 
-  def write_to_csv(self, pressure_filename="pressure_data.csv", massflow_filename="massflow_data.csv", output_dir="simulation_results"):
+    def write_to_csv(self, pressure_filename="pressure_data.csv", massflow_filename="massflow_data.csv", temperature_filename="temperature_results.csv", output_dir="simulation_results"):
         """
         Write pressure and mass flow data to separate CSV files in a specified directory.
         
@@ -131,6 +155,8 @@ class FeedSystemCriticalPath:
         # Full file paths
         pressure_path = os.path.join(output_dir, pressure_filename)
         massflow_path = os.path.join(output_dir, massflow_filename)
+        temperature_path = os.path.join(output_dir, temperature_filename)
+        metadata_path = os.path.join(output_dir, "simulation_metadata.csv")
         
         # Get only real cells (exclude ghost cells)
         real_cells = [c for c in self.discretisedFeed if c.type != 'g']
@@ -139,12 +165,61 @@ class FeedSystemCriticalPath:
         # Create time array
         time_array = np.arange(self.current_iteration) * self.dt
         
-        # Write pressure data
+        # Write metadata file
+        with open(metadata_path, 'w', newline='') as metadata_file:
+            writer = csv.writer(metadata_file)
+            writer.writerow(['Parameter', 'Value', 'Unit'])
+            writer.writerow(['Total Iterations', self.current_iteration, 'iterations'])
+            writer.writerow(['Time Step (dt)', self.dt, 's'])
+            writer.writerow(['Total Simulation Time', time_array[-1] if len(time_array) > 0 else 0, 's'])
+            writer.writerow(['Number of Nodes', len(real_cells), 'nodes'])
+            writer.writerow(['Pipe Length', self.totalPipeLength, 'm'])
+            writer.writerow(['Node Spacing (dL)', self.dL, 'm'])
+            writer.writerow(['Inlet Pressure', self.inletPressure, 'Pa'])
+            writer.writerow(['Outlet Pressure', self.outletPressure, 'Pa'])
+            writer.writerow(['Initial Mass Flow', self.mdot, 'kg/s'])
+        
+        #write temp data with metadata comments
+        with open(temperature_path, 'w', newline='') as temp_file:
+            writer = csv.writer(temp_file)
+            
+            # Write metadata as comments
+            writer.writerow(['# Simulation Metadata'])
+            writer.writerow([f'# Total Iterations: {self.current_iteration}'])
+            writer.writerow([f'# Time Step (dt): {self.dt} s'])
+            writer.writerow([f'# Total Simulation Time: {time_array[-1] if len(time_array) > 0 else 0} s'])
+            writer.writerow([f'# Number of Nodes: {len(real_cells)}'])
+            writer.writerow([f'# Pipe Length: {self.totalPipeLength} m'])
+            writer.writerow([f'# Node Spacing (dL): {self.dL} m'])
+            writer.writerow(['# Data begins below'])
+            
+            # Write header
+            header = ['Time (s)'] + [f'{cell.getType()}_{cell.getID()}_Temperature (K)' for cell in real_cells]
+            writer.writerow(header)
+            
+            # Write data row by row
+            for i in range(self.current_iteration):
+                row = [time_array[i]]
+                for cell_id in real_cell_ids:
+                    row.append(self.temp_history[cell_id, i])
+                writer.writerow(row)
+        # Write pressure data with metadata comments
         with open(pressure_path, 'w', newline='') as pressure_file:
             writer = csv.writer(pressure_file)
             
+            # Write metadata as comments
+            writer.writerow(['# Simulation Metadata'])
+            writer.writerow([f'# Total Iterations: {self.current_iteration}'])
+            writer.writerow([f'# Time Step (dt): {self.dt} s'])
+            writer.writerow([f'# Total Simulation Time: {time_array[-1] if len(time_array) > 0 else 0} s'])
+            writer.writerow([f'# Number of Nodes: {len(real_cells)}'])
+            writer.writerow([f'# Pipe Length: {self.totalPipeLength} m'])
+            writer.writerow([f'# Node Spacing (dL): {self.dL} m'])
+            writer.writerow(['# Data begins below'])
+            
+            cell: systemComponent
             # Write header
-            header = ['Time (s)'] + [f'Cell_{cell_id}_Pressure (Pa)' for cell_id in real_cell_ids]
+            header = ['Time (s)'] + [f'{cell.getType()}_{cell.getID()}_Pressure (Pa)' for cell in real_cells]
             writer.writerow(header)
             
             # Write data row by row
@@ -154,12 +229,22 @@ class FeedSystemCriticalPath:
                     row.append(self.pressure_history[cell_id, i])
                 writer.writerow(row)
         
-        # Write mass flow data
+        # Write mass flow data with metadata comments
         with open(massflow_path, 'w', newline='') as massflow_file:
             writer = csv.writer(massflow_file)
             
+            # Write metadata as comments
+            writer.writerow(['# Simulation Metadata'])
+            writer.writerow([f'# Total Iterations: {self.current_iteration}'])
+            writer.writerow([f'# Time Step (dt): {self.dt} s'])
+            writer.writerow([f'# Total Simulation Time: {time_array[-1] if len(time_array) > 0 else 0} s'])
+            writer.writerow([f'# Number of Nodes: {len(real_cells)}'])
+            writer.writerow([f'# Pipe Length: {self.totalPipeLength} m'])
+            writer.writerow([f'# Node Spacing (dL): {self.dL} m'])
+            writer.writerow(['# Data begins below'])
+            
             # Write header
-            header = ['Time (s)'] + [f'Cell_{cell_id}_Massflow (kg/s)' for cell_id in real_cell_ids]
+            header = ['Time (s)'] + [f'{cell.getType()}_{cell.getID()}_Massflow (kg/s)' for cell in real_cells]
             writer.writerow(header)
             
             # Write data row by row
@@ -172,6 +257,7 @@ class FeedSystemCriticalPath:
         print(f"Data written to:")
         print(f"  Pressure: {pressure_path}")
         print(f"  Mass flow: {massflow_path}")
+        print(f"  Metadata: {metadata_path}")
         print(f"Data shape: {self.current_iteration} time steps x {len(real_cell_ids)} cells")
 
 
@@ -242,6 +328,45 @@ class systemComponent:
             mdot_history[self.id, iteration] = self.mdot if self.mdot is not None else 0
             velocity_history[self.id, iteration] = self.u_iterate if self.u_iterate is not None else 0
 
+    def update(self, nextPressure: Optional[float] = None):
+        self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
+        self.rho = self.fluid.density
+        a = self.fluid.sound_speed
+        self.outletPressure = nextPressure
+        self.solveMdot(outletPressure=nextPressure)
+
+    def solveMdot(self, inletPressure: Optional[float] = None, outletPressure: Optional[float] = None):
+        if inletPressure is None:
+            inletPressure = self.pressureIn
+        if outletPressure is None:#change inlet outlet pressures, and update them when calculating pressures
+            outletPressure = self.pressureOut
+       
+        self.mdot = None  # Reset mdot before solving
+        if inletPressure is not None:
+            currentInletPres = inletPressure
+            for i, node in enumerate(self.orderedNodes):
+                node.setPressureIn(currentInletPres)
+                dp = node.dp(self.fluid, self.mdot)
+                currentInletPres -= dp
+                node.setPressureOut(currentInletPres)
+            self.outletPressure = currentInletPres
+            
+        elif outletPressure is not None:
+            total_dp = self.getFeedPathDP()      
+            inletPressure = outletPressure + total_dp
+            nodePressure = inletPressure
+            for i, node in enumerate(self.orderedNodes):
+                node.setPressureIn(nodePressure)
+                dp = node.dp(self.fluid, self.mdot)
+                nodePressure -= dp
+                node.setPressureOut(nodePressure)
+            self.inletPressure = inletPressure
+            
+        else:
+            # Should not reach here due to _check_ready, but just in case
+            raise ValueError("Neither inletPressure nor outletPressure is defined.")
+
+#fix mdot
     def getID(self):
         return self.id
     def getuIn(self):
@@ -262,7 +387,8 @@ class systemComponent:
         return self.u_iterate
     def set_u_iterate(self, u_iterate):
         self.u_iterate = u_iterate
-
+    def getType(self):  
+        return self.type
     def getPressureIn(self):
         return self.pressureIn
 
@@ -287,10 +413,10 @@ class ghostCell(systemComponent):
         self.uIn = u
         self.uOut = self.uIn
         self.u_iterate = u
-        if prevComp is not None:
-            prevComp: systemComponent
-            #prevComp.setuOut(u)
-            prevComp.setMdot(0.01)
+        # if prevComp is not None:
+        #     prevComp: systemComponent
+        #     prevComp.setuOut(0)
+        #     prevComp.setMdot(0.01)
     
     def getVelocity(self):
         """
@@ -299,7 +425,7 @@ class ghostCell(systemComponent):
         return self.u_iterate
 
     def dp(self):
-        return 0.0  # No pressure drop in ghost cells
+        return 0 # No pressure drop in ghost cells
     def setU(self, uIn):
         super().setuIn(uIn)
         super().setuOut(uIn)
@@ -376,30 +502,25 @@ class Pipe(systemComponent):
     def dp(self, pressureIn=None, mdot=None):
         if pressureIn is not None:
             self.pressureIn = pressureIn
-        self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp)) 
+            self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp)) 
         if mdot is not None:
             self.mdot = mdot
         dp = self.darcyWeisbach()
-        
+        self.pressureOut = self.pressureIn - dp
         return dp
 
-    def update(self):
-        self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
-        self.rho = self.fluid.density
-        a = self.fluid.sound_speed
-        self.mdot = self.u_iterate * self.rho * np.pi * (self.diameter / 2) ** 2
-
+    
     def solve(self, prevVelocity, nextPressure,dt):
-        self.update()
-        
-        self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
+        super().update(nextPressure=nextPressure)
+
+        entropy = self.fluid.entropy
         self.rho = self.fluid.density
         a = self.fluid.sound_speed
         dpdt = self.rho*a**2 *(prevVelocity - self.u_iterate)/self.length
         self.pressureIn+= dpdt * dt
         dudt = ((1/self.length)*(self.pressureIn +self.rho*(self.uIn)**2 - nextPressure - self.rho*(self.uOut)**2) - self.darcyWeisbachDirectional())/self.rho
         self.u_iterate += dudt * dt
-        #self.fluid = self.fluid.isentropic_compression_to_pressure(self.pressureIn)
+        self.fluid.update(Input.pressure(self.pressureIn), Input.entropy(entropy))
         self.temp = self.fluid.temperature
         #self.record()
 
@@ -410,6 +531,29 @@ class Pipe(systemComponent):
         self.pressureThroughTime.append(self.pressureIn)
         self.tempThroughTime.append(self.temp)
         self.mdotThroughTime.append(self.mdot)
+
+class Orifice(systemComponent):
+    def __init__(self, fluid: Fluid, OD=0.05, ID=0.04, location=0, pos=None, pressureIn=0, pressureOut=0, temp=None, rho=None, mdot=None, l=0.01):
+        super().__init__(type='o', location=location, pos=pos, pressureIn=pressureIn, pressureOut=pressureOut, temp=temp, rho=rho, mdot=mdot, fluid=fluid)
+        self.outerD = OD
+        self.innerD = ID
+        self.length = l  # Length of the orifice
+        self.pressureOut = pressureOut  # Pressure at the outlet of the orifice
+        self.CdA = CdA
+        
+
+    def dp(self, pressureIn=None, mdot=None, timestep=None):
+        if pressureIn is not None:
+            self.pressureIn = pressureIn
+        if mdot is not None:
+            self.mdot = mdot
+        self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp))
+        self.rho = self.fluid.density
+        area = np.pi * (self.innerD / 2) ** 2
+        return (self.mdot /(self.CdA*np.sqrt(2/self.rho)))
+    
+
+    
 
 
 def barA(pa):
@@ -422,10 +566,10 @@ if __name__ == "__main__":
     # Example usage
     fluid = Fluid(FluidsList.Oxygen)
     fluid.update(Input.temperature(-180), Input.pressure(barA(100)))
-    simTime = 5 #s
+    simTime = 3 #s
     timeIterations= 1000
     dt = simTime / timeIterations
-    feed_system = FeedSystemCriticalPath(dt = dt,totalPipeLength=1.0, fluid=fluid, N=5, mdot=1, inletPressure=barA(100), outletPressure=barA(50), max_iterations=timeIterations+100)
+    feed_system = FeedSystemCriticalPath(dt = dt,totalPipeLength=1.0, fluid=fluid, N=5, mdot=1, inletPressure=barA(100), outletPressure=barA(50))
 
     dL = feed_system.dL
     initial_velocity = feed_system.discretisedFeed[1].getVelocity()
@@ -433,66 +577,28 @@ if __name__ == "__main__":
     cfl_dt = dL / (abs(initial_velocity) + sound_speed)
     # Use a safety factor (e.g., 0.5) and choose the smaller of user-defined or CFL dt
     dt = min(simTime / timeIterations, 0.5 * cfl_dt)
-    feed_system.dt = dt / 10
+    feed_system.dt = dt / 100
     timeIterations = round(simTime / feed_system.dt)
+    feed_system.setMaxIterations(timeIterations+100)
     print(f"Sim time: {feed_system.dt * timeIterations} s, dt: {feed_system.dt} s, dL: {dL} m, CFL dt: {cfl_dt} s")
     print(timeIterations, "iterations")
 
     for i in range(timeIterations):
         feed_system.solve()
-        if i > 0 and i % 1000 == 0:
-            print(f"Progress: {i / timeIterations * 100:.5f}%")
+        if i > 0 and i % 100 == 0:
+            print(f"Progress: {i / timeIterations * 100:.5f}%", end='\r')
 
-    
-    output_folder = f"simulation_results_{timestamp}"
+    print("Progress: 100.00000%", end='\r')
+
+    output_folder = f"simulation_results_{dt}_{simTime}"
     
     # Write CSV files to the new folder
     feed_system.write_to_csv(
         pressure_filename="pressure_results.csv", 
         massflow_filename="massflow_results.csv",
-        output_dir=output_folder
+        temperature_filename="temperature_results.csv",
+        output_dir=output_folder        
     )        
     
 
-    import matplotlib.pyplot as plt
-
-    # gather only the real cells (exclude ghost cells)
-    real_cells = [c for c in feed_system.discretisedFeed if c.type != 'g']
-
-    # pick the start, middle and end indices
-    idxs = [0, len(real_cells) // 2, len(real_cells) - 1]
-    positions = ['start', 'middle', 'end']
-
-    # Use optimized data access from pre-allocated arrays
-    fig, axes = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
-
-    for ax, idx, pos in zip(axes, idxs, positions):
-        cell = real_cells[idx]
-        cell_id = cell.getID()
-        
-        # Get data from pre-allocated arrays
-        cell_data = feed_system.get_cell_data(cell_id, up_to_iteration=feed_system.current_iteration)
-        
-        # build full time array
-        t = np.arange(feed_system.current_iteration) * feed_system.dt
-        p_bar = cell_data['pressure'] / 1e5
-        mdot = cell_data['mdot']
-
-        # plot pressure
-        ax.plot(t, p_bar, 'b-', label='Pressure (bar)')
-        ax.set_ylabel('Pressure (bar)', color='b')
-        ax.tick_params(axis='y', labelcolor='b')
-        ax.grid(True)
-
-        # plot mass flow rate on twin axis
-        ax2 = ax.twinx()
-        ax2.plot(t, mdot, 'r--', label='Mass flow (kg/s)')
-        ax2.set_ylabel('Mass flow (kg/s)', color='r')
-        ax2.tick_params(axis='y', labelcolor='r')
-
-        ax.set_title(f'Cell at {pos} of feed system')
-
-    axes[-1].set_xlabel('Time (s)')
-    plt.tight_layout()
-    plt.show()
-    print(dt)
+    print(f"\nSimulation completed. Data written to {output_folder}")

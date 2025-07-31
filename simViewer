@@ -1,0 +1,947 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import os
+import glob
+from typing import List, Optional, Tuple
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from scipy.fft import fft, fftfreq
+from scipy.signal import find_peaks
+
+class SimulationViewer:
+    def __init__(self, pressure_csv: str = None, massflow_csv: str = None):
+        """
+        Initialize the simulation viewer with CSV files.
+        
+        Args:
+            pressure_csv: Path to pressure data CSV file
+            massflow_csv: Path to mass flow data CSV file
+        """
+        self.pressure_data = None
+        self.massflow_data = None
+        self.time_array = None
+        self.cell_ids = None
+        self.cell_positions = None
+        
+        if pressure_csv and massflow_csv:
+            self.load_data(pressure_csv, massflow_csv)
+    
+    def load_data(self, pressure_csv: str, massflow_csv: str):
+        """Load data from CSV files."""
+        try:
+            # Load pressure data - skip metadata comment lines
+            self.pressure_df = pd.read_csv(pressure_csv, comment='#')
+            self.massflow_df = pd.read_csv(massflow_csv, comment='#')
+            
+            # Extract metadata from CSV files
+            self.metadata = self.extract_metadata(pressure_csv)
+            
+            # Extract time array
+            self.time_array = self.pressure_df['Time (s)'].values
+            
+            # Extract cell information from column headers
+            pressure_cols = [col for col in self.pressure_df.columns if 'Pressure' in col]
+            massflow_cols = [col for col in self.massflow_df.columns if 'Massflow' in col]
+            
+            # Extract cell IDs and types
+            self.cell_info = []
+            for col in pressure_cols:
+                # Parse column name like "p_1_Pressure (Pa)"
+                parts = col.split('_')
+                cell_type = parts[0]
+                cell_id = int(parts[1])
+                self.cell_info.append((cell_id, cell_type))
+            
+            # Sort by cell ID
+            self.cell_info.sort(key=lambda x: x[0])
+            self.cell_ids = [info[0] for info in self.cell_info]
+            
+            # Convert to numpy arrays for easier manipulation
+            pressure_data = []
+            massflow_data = []
+            
+            for cell_id, cell_type in self.cell_info:
+                pressure_col = f'{cell_type}_{cell_id}_Pressure (Pa)'
+                massflow_col = f'{cell_type}_{cell_id}_Massflow (kg/s)'
+                
+                pressure_data.append(self.pressure_df[pressure_col].values)
+                massflow_data.append(self.massflow_df[massflow_col].values)
+            
+            self.pressure_data = np.array(pressure_data)  # Shape: (n_cells, n_timesteps)
+            self.massflow_data = np.array(massflow_data)
+            
+            print(f"Loaded data: {len(self.cell_ids)} cells, {len(self.time_array)} time steps")
+            print(f"Time range: {self.time_array[0]:.6f} to {self.time_array[-1]:.6f} seconds")
+            
+        except Exception as e:
+            raise Exception(f"Error loading data: {str(e)}")
+    
+    def extract_metadata(self, csv_file: str):
+        """Extract metadata from CSV file comments or separate metadata file."""
+        metadata = {}
+        
+        # Try to load from separate metadata file first
+        metadata_file = os.path.join(os.path.dirname(csv_file), "simulation_metadata.csv")
+        if os.path.exists(metadata_file):
+            try:
+                meta_df = pd.read_csv(metadata_file)
+                for _, row in meta_df.iterrows():
+                    param = row['Parameter']
+                    value = row['Value']
+                    unit = row['Unit'] if 'Unit' in row else ''
+                    metadata[param] = {'value': value, 'unit': unit}
+                return metadata
+            except:
+                pass
+        
+        # Fallback: extract from CSV comments
+        try:
+            with open(csv_file, 'r') as f:
+                for line in f:
+                    if line.startswith('#'):
+                        # Parse comment lines like "# Total Iterations: 1000"
+                        if ':' in line:
+                            parts = line[1:].strip().split(':', 1)
+                            if len(parts) == 2:
+                                key = parts[0].strip()
+                                value_unit = parts[1].strip()
+                                
+                                # Try to separate value and unit
+                                value_parts = value_unit.split()
+                                if len(value_parts) >= 1:
+                                    try:
+                                        value = float(value_parts[0])
+                                        unit = ' '.join(value_parts[1:]) if len(value_parts) > 1 else ''
+                                        metadata[key] = {'value': value, 'unit': unit}
+                                    except ValueError:
+                                        metadata[key] = {'value': value_unit, 'unit': ''}
+                    else:
+                        break  # Stop at first non-comment line
+        except:
+            pass
+        
+        # If no metadata found, calculate from data
+        if not metadata:
+            metadata = {
+                'Number of Nodes': {'value': len(self.cell_ids) if hasattr(self, 'cell_ids') else 0, 'unit': 'nodes'},
+                'Total Iterations': {'value': len(self.time_array) if hasattr(self, 'time_array') else 0, 'unit': 'iterations'},
+                'Time Step (dt)': {'value': (self.time_array[1] - self.time_array[0]) if hasattr(self, 'time_array') and len(self.time_array) > 1 else 0, 'unit': 's'},
+                'Total Simulation Time': {'value': self.time_array[-1] if hasattr(self, 'time_array') and len(self.time_array) > 0 else 0, 'unit': 's'}
+            }
+        
+        return metadata
+    
+    def plot_nodes_vs_time(self, node_indices: List[int] = None, plot_type: str = 'both'):
+        """
+        Plot selected nodes vs time.
+        
+        Args:
+            node_indices: List of node indices to plot. If None, plots evenly spaced nodes
+            plot_type: 'pressure', 'massflow', or 'both'
+        """
+        if self.pressure_data is None:
+            raise ValueError("No data loaded. Please load CSV files first.")
+        
+        if node_indices is None:
+            # Select 5 evenly spaced nodes by default
+            n_nodes = min(5, len(self.cell_ids))
+            node_indices = np.linspace(0, len(self.cell_ids)-1, n_nodes, dtype=int)
+        
+        if plot_type == 'both':
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        else:
+            fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+            ax1 = ax2 = ax
+        
+        colors = plt.cm.viridis(np.linspace(0, 1, len(node_indices)))
+        
+        if plot_type in ['pressure', 'both']:
+            for i, node_idx in enumerate(node_indices):
+                cell_id = self.cell_ids[node_idx]
+                pressure_bar = self.pressure_data[node_idx] / 1e5  # Convert to bar
+                ax1.plot(self.time_array, pressure_bar, color=colors[i], 
+                        label=f'Cell {cell_id}', linewidth=2)
+            
+            ax1.set_ylabel('Pressure (bar)')
+            ax1.set_title('Pressure vs Time for Selected Nodes')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+        
+        if plot_type in ['massflow', 'both']:
+            ax_mdot = ax2 if plot_type == 'both' else ax1
+            for i, node_idx in enumerate(node_indices):
+                cell_id = self.cell_ids[node_idx]
+                massflow = self.massflow_data[node_idx]
+                ax_mdot.plot(self.time_array, massflow, color=colors[i], 
+                           label=f'Cell {cell_id}', linewidth=2)
+            
+            ax_mdot.set_ylabel('Mass Flow (kg/s)')
+            ax_mdot.set_title('Mass Flow vs Time for Selected Nodes')
+            ax_mdot.grid(True, alpha=0.3)
+            ax_mdot.legend()
+        
+        plt.xlabel('Time (s)')
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_pipe_snapshot(self, time_index: int = -1, plot_type: str = 'both'):
+        """
+        Plot all nodes along the pipe at a single time step.
+        
+        Args:
+            time_index: Index of the time step to plot (-1 for last time step)
+            plot_type: 'pressure', 'massflow', or 'both'
+        """
+        if self.pressure_data is None:
+            raise ValueError("No data loaded. Please load CSV files first.")
+        
+        if time_index == -1:
+            time_index = len(self.time_array) - 1
+        
+        time_value = self.time_array[time_index]
+        
+        if plot_type == 'both':
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        else:
+            fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+            ax1 = ax2 = ax
+        
+        # Create position array (assuming uniform spacing)
+        positions = np.arange(len(self.cell_ids))
+        
+        if plot_type in ['pressure', 'both']:
+            pressure_bar = self.pressure_data[:, time_index] / 1e5
+            ax1.plot(positions, pressure_bar, 'bo-', linewidth=2, markersize=6)
+            ax1.set_ylabel('Pressure (bar)')
+            ax1.set_title(f'Pressure along Pipe at t = {time_value:.6f} s')
+            ax1.grid(True, alpha=0.3)
+        
+        if plot_type in ['massflow', 'both']:
+            ax_mdot = ax2 if plot_type == 'both' else ax1
+            massflow = self.massflow_data[:, time_index]
+            ax_mdot.plot(positions, massflow, 'ro-', linewidth=2, markersize=6)
+            ax_mdot.set_ylabel('Mass Flow (kg/s)')
+            ax_mdot.set_title(f'Mass Flow along Pipe at t = {time_value:.6f} s')
+            ax_mdot.grid(True, alpha=0.3)
+        
+        plt.xlabel('Node Position')
+        plt.tight_layout()
+        plt.show()
+    
+    def create_live_animation(self, interval: int = 50, save_animation: bool = False, 
+                            animation_filename: str = "pipe_animation.mp4"):
+        """
+        Create a live animation of the entire pipe showing both pressure and mass flow.
+        
+        Args:
+            interval: Animation update interval in milliseconds
+            save_animation: Whether to save the animation as a video file
+            animation_filename: Filename for saved animation
+        """
+        if self.pressure_data is None:
+            raise ValueError("No data loaded. Please load CSV files first.")
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        
+        # Create position array
+        positions = np.arange(len(self.cell_ids))
+        
+        # Initialize plots
+        line1, = ax1.plot([], [], 'bo-', linewidth=2, markersize=6)
+        line2, = ax2.plot([], [], 'ro-', linewidth=2, markersize=6)
+        
+        # Set up axes
+        ax1.set_xlim(0, len(self.cell_ids) - 1)
+        ax1.set_ylim(np.min(self.pressure_data) / 1e5 * 0.95, 
+                     np.max(self.pressure_data) / 1e5 * 1.05)
+        ax1.set_ylabel('Pressure (bar)')
+        ax1.grid(True, alpha=0.3)
+        
+        ax2.set_xlim(0, len(self.cell_ids) - 1)
+        ax2.set_ylim(np.min(self.massflow_data) * 1.05, 
+                     np.max(self.massflow_data) * 1.05)
+        ax2.set_ylabel('Mass Flow (kg/s)')
+        ax2.set_xlabel('Node Position')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add time text
+        time_text = ax1.text(0.02, 0.95, '', transform=ax1.transAxes, fontsize=12,
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        def animate(frame):
+            if frame < len(self.time_array):
+                # Update pressure
+                pressure_bar = self.pressure_data[:, frame] / 1e5
+                line1.set_data(positions, pressure_bar)
+                
+                # Update mass flow
+                massflow = self.massflow_data[:, frame]
+                line2.set_data(positions, massflow)
+                
+                # Update time
+                time_text.set_text(f'Time: {self.time_array[frame]:.6f} s')
+                
+                # Update titles
+                ax1.set_title(f'Pressure along Pipe (t = {self.time_array[frame]:.6f} s)')
+                ax2.set_title(f'Mass Flow along Pipe (t = {self.time_array[frame]:.6f} s)')
+            
+            return line1, line2, time_text
+        
+        # Create animation
+        anim = FuncAnimation(fig, animate, frames=len(self.time_array), 
+                           interval=interval, blit=False, repeat=True)
+        
+        if save_animation:
+            print(f"Saving animation to {animation_filename}...")
+            anim.save(animation_filename, writer='ffmpeg', fps=1000//interval)
+            print("Animation saved!")
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return anim
+    
+    def interactive_time_selector(self):
+        """Create an interactive plot with time slider for pipe snapshots."""
+        if self.pressure_data is None:
+            raise ValueError("No data loaded. Please load CSV files first.")
+        
+        from matplotlib.widgets import Slider
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        plt.subplots_adjust(bottom=0.15)
+        
+        # Initial plot
+        positions = np.arange(len(self.cell_ids))
+        initial_time_idx = 0
+        
+        line1, = ax1.plot(positions, self.pressure_data[:, initial_time_idx] / 1e5, 
+                         'bo-', linewidth=2, markersize=6)
+        line2, = ax2.plot(positions, self.massflow_data[:, initial_time_idx], 
+                         'ro-', linewidth=2, markersize=6)
+        
+        ax1.set_ylabel('Pressure (bar)')
+        ax1.grid(True, alpha=0.3)
+        ax2.set_ylabel('Mass Flow (kg/s)')
+        ax2.set_xlabel('Node Position')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add slider
+        ax_slider = plt.axes([0.1, 0.05, 0.8, 0.03])
+        slider = Slider(ax_slider, 'Time Index', 0, len(self.time_array) - 1, 
+                       valinit=initial_time_idx, valfmt='%d')
+        
+        def update(val):
+            time_idx = int(slider.val)
+            time_value = self.time_array[time_idx]
+            
+            # Update pressure
+            pressure_bar = self.pressure_data[:, time_idx] / 1e5
+            line1.set_ydata(pressure_bar)
+            ax1.set_title(f'Pressure along Pipe at t = {time_value:.6f} s')
+            
+            # Update mass flow
+            massflow = self.massflow_data[:, time_idx]
+            line2.set_ydata(massflow)
+            ax2.set_title(f'Mass Flow along Pipe at t = {time_value:.6f} s')
+            
+            fig.canvas.draw()
+        
+        slider.on_changed(update)
+        update(initial_time_idx)  # Initial update
+        
+        plt.show()
+    
+    def calculate_fft(self, data: np.ndarray, dt: float):
+        """
+        Calculate FFT of time series data.
+        
+        Args:
+            data: Time series data array
+            dt: Time step
+            
+        Returns:
+            frequencies: Frequency array
+            fft_magnitude: Magnitude of FFT
+            dominant_freq: Dominant frequency
+        """
+        # Remove DC component (mean)
+        data_centered = data - np.mean(data)
+        
+        # Apply windowing to reduce spectral leakage
+        window = np.hanning(len(data_centered))
+        data_windowed = data_centered * window
+        
+        # Calculate FFT
+        fft_result = fft(data_windowed)
+        fft_magnitude = np.abs(fft_result)
+        
+        # Generate frequency array
+        frequencies = fftfreq(len(data), dt)
+        
+        # Take only positive frequencies
+        n = len(frequencies) // 2
+        frequencies = frequencies[:n]
+        fft_magnitude = fft_magnitude[:n]
+        
+        # Find dominant frequency (excluding DC component)
+        if len(fft_magnitude) > 1:
+            # Find peaks in the spectrum
+            peaks, _ = find_peaks(fft_magnitude[1:], height=np.max(fft_magnitude) * 0.1)
+            if len(peaks) > 0:
+                # Get the highest peak
+                max_peak_idx = peaks[np.argmax(fft_magnitude[1:][peaks])] + 1
+                dominant_freq = frequencies[max_peak_idx]
+            else:
+                # Fallback: find maximum excluding DC
+                dominant_freq = frequencies[1:][np.argmax(fft_magnitude[1:])]
+        else:
+            dominant_freq = 0
+        
+        return frequencies, fft_magnitude, dominant_freq
+    
+    def plot_fft_analysis(self, node_indices: List[int] = None, data_type: str = 'both'):
+        """
+        Plot FFT analysis of selected nodes.
+        
+        Args:
+            node_indices: List of node indices to analyze. If None, uses middle node
+            data_type: 'pressure', 'massflow', or 'both'
+        """
+        if self.pressure_data is None:
+            raise ValueError("No data loaded. Please load CSV files first.")
+        
+        if node_indices is None:
+            # Use middle node by default
+            node_indices = [len(self.cell_ids) // 2]
+        
+        # Calculate time step
+        dt = self.time_array[1] - self.time_array[0] if len(self.time_array) > 1 else 1.0
+        
+        if data_type == 'both':
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        else:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+            ax3 = ax4 = None
+        
+        colors = plt.cm.viridis(np.linspace(0, 1, len(node_indices)))
+        
+        dominant_freqs_pressure = []
+        dominant_freqs_massflow = []
+        
+        # Pressure FFT analysis
+        if data_type in ['pressure', 'both']:
+            ax_time = ax1
+            ax_freq = ax2 if data_type != 'both' else ax3
+            
+            for i, node_idx in enumerate(node_indices):
+                cell_id = self.cell_ids[node_idx]
+                pressure_data = self.pressure_data[node_idx] / 1e5  # Convert to bar
+                
+                # Time domain plot
+                ax_time.plot(self.time_array, pressure_data, color=colors[i], 
+                           label=f'Cell {cell_id}', linewidth=1.5)
+                
+                # FFT analysis
+                freqs, fft_mag, dom_freq = self.calculate_fft(pressure_data, dt)
+                dominant_freqs_pressure.append(dom_freq)
+                
+                # Frequency domain plot
+                ax_freq.semilogy(freqs, fft_mag, color=colors[i], 
+                               label=f'Cell {cell_id} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
+                
+                # Mark dominant frequency
+                ax_freq.axvline(dom_freq, color=colors[i], linestyle='--', alpha=0.7)
+            
+            ax_time.set_xlabel('Time (s)')
+            ax_time.set_ylabel('Pressure (bar)')
+            ax_time.set_title('Pressure Time Series')
+            ax_time.grid(True, alpha=0.3)
+            ax_time.legend()
+            
+            ax_freq.set_xlabel('Frequency (Hz)')
+            ax_freq.set_ylabel('FFT Magnitude')
+            ax_freq.set_title('Pressure FFT Analysis')
+            ax_freq.grid(True, alpha=0.3)
+            ax_freq.legend()
+        
+        # Mass flow FFT analysis
+        if data_type in ['massflow', 'both']:
+            ax_time = ax1 if data_type == 'massflow' else ax2
+            ax_freq = ax2 if data_type == 'massflow' else ax4
+            
+            for i, node_idx in enumerate(node_indices):
+                cell_id = self.cell_ids[node_idx]
+                massflow_data = self.massflow_data[node_idx]
+                
+                # Time domain plot
+                ax_time.plot(self.time_array, massflow_data, color=colors[i], 
+                           label=f'Cell {cell_id}', linewidth=1.5)
+                
+                # FFT analysis
+                freqs, fft_mag, dom_freq = self.calculate_fft(massflow_data, dt)
+                dominant_freqs_massflow.append(dom_freq)
+                
+                # Frequency domain plot
+                ax_freq.semilogy(freqs, fft_mag, color=colors[i], 
+                               label=f'Cell {cell_id} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
+                
+                # Mark dominant frequency
+                ax_freq.axvline(dom_freq, color=colors[i], linestyle='--', alpha=0.7)
+            
+            ax_time.set_xlabel('Time (s)')
+            ax_time.set_ylabel('Mass Flow (kg/s)')
+            ax_time.set_title('Mass Flow Time Series')
+            ax_time.grid(True, alpha=0.3)
+            ax_time.legend()
+            
+            ax_freq.set_xlabel('Frequency (Hz)')
+            ax_freq.set_ylabel('FFT Magnitude')
+            ax_freq.set_title('Mass Flow FFT Analysis')
+            ax_freq.grid(True, alpha=0.3)
+            ax_freq.legend()
+        
+        # Add summary text
+        summary_text = "Dominant Frequencies:\n"
+        if dominant_freqs_pressure:
+            avg_freq_p = np.mean(dominant_freqs_pressure)
+            summary_text += f"Pressure: {avg_freq_p:.2f} Hz (avg)\n"
+        if dominant_freqs_massflow:
+            avg_freq_m = np.mean(dominant_freqs_massflow)
+            summary_text += f"Mass Flow: {avg_freq_m:.2f} Hz (avg)\n"
+        
+        # Add text box with summary
+        if data_type == 'both':
+            fig.text(0.02, 0.98, summary_text, transform=fig.transFigure, 
+                    verticalalignment='top', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        else:
+            ax1.text(0.02, 0.98, summary_text, transform=ax1.transAxes, 
+                    verticalalignment='top', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return {
+            'pressure_dominant_freqs': dominant_freqs_pressure,
+            'massflow_dominant_freqs': dominant_freqs_massflow,
+            'average_pressure_freq': np.mean(dominant_freqs_pressure) if dominant_freqs_pressure else None,
+            'average_massflow_freq': np.mean(dominant_freqs_massflow) if dominant_freqs_massflow else None
+        }
+
+
+class SimulationViewerGUI:
+    """GUI interface for the simulation viewer."""
+    
+    def __init__(self):
+        self.viewer = SimulationViewer()
+        self.setup_gui()
+    
+    def setup_gui(self):
+        self.root = tk.Tk()
+        self.root.title("Fluid Oscillation Simulation Viewer")
+        self.root.geometry("800x600")
+        
+        # Create main frame with two columns
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Left column for file loading and data info
+        left_frame = ttk.Frame(main_frame)
+        left_frame.pack(side="left", fill="y", padx=(0, 10))
+        
+        # Right column for plotting options
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side="right", fill="both", expand=True)
+        
+        # File loading frame
+        file_frame = ttk.LabelFrame(left_frame, text="Load Data Files", padding=10)
+        file_frame.pack(fill="x", pady=(0, 10))
+        
+        ttk.Button(file_frame, text="Browse for Pressure CSV", 
+                  command=self.browse_pressure_file).pack(pady=2)
+        self.pressure_file_label = ttk.Label(file_frame, text="No pressure file selected", 
+                                           wraplength=200, justify="left")
+        self.pressure_file_label.pack(pady=2)
+        
+        ttk.Button(file_frame, text="Browse for Mass Flow CSV", 
+                  command=self.browse_massflow_file).pack(pady=2)
+        self.massflow_file_label = ttk.Label(file_frame, text="No mass flow file selected", 
+                                           wraplength=200, justify="left")
+        self.massflow_file_label.pack(pady=2)
+        
+        ttk.Button(file_frame, text="Load Data", command=self.load_data).pack(pady=5)
+        
+        # Data Information frame
+        self.info_frame = ttk.LabelFrame(left_frame, text="Simulation Data Info", padding=10)
+        self.info_frame.pack(fill="both", expand=True)
+        
+        # Create scrollable text widget for data info
+        info_scroll_frame = ttk.Frame(self.info_frame)
+        info_scroll_frame.pack(fill="both", expand=True)
+        
+        self.info_text = tk.Text(info_scroll_frame, height=15, width=35, wrap=tk.WORD, 
+                                state=tk.DISABLED, font=("Helvetica", 13))
+        scrollbar = ttk.Scrollbar(info_scroll_frame, orient="vertical", command=self.info_text.yview)
+        self.info_text.configure(yscrollcommand=scrollbar.set)
+        
+        self.info_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Initialize with empty message
+        self.update_info_display({})
+        
+        # Plotting options frame
+        plot_frame = ttk.LabelFrame(right_frame, text="Plotting Options", padding=10)
+        plot_frame.pack(fill="both", expand=True)
+        
+        # Node selection for time series
+        ttk.Label(plot_frame, text="Nodes vs Time Plot:").pack(anchor="w")
+        node_frame = ttk.Frame(plot_frame)
+        node_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(node_frame, text="Node indices (comma-separated):").pack(side="left")
+        self.node_entry = ttk.Entry(node_frame, width=20)
+        self.node_entry.pack(side="left", padx=5)
+        self.node_entry.insert(0, "0,2,4")  # Default values
+        
+        plot_type_frame = ttk.Frame(plot_frame)
+        plot_type_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(plot_type_frame, text="Plot type:").pack(side="left")
+        self.plot_type_var = tk.StringVar(value="both")
+        ttk.Radiobutton(plot_type_frame, text="Both", variable=self.plot_type_var, 
+                       value="both").pack(side="left")
+        ttk.Radiobutton(plot_type_frame, text="Pressure", variable=self.plot_type_var, 
+                       value="pressure").pack(side="left")
+        ttk.Radiobutton(plot_type_frame, text="Mass Flow", variable=self.plot_type_var, 
+                       value="massflow").pack(side="left")
+        
+        ttk.Button(plot_frame, text="Plot Nodes vs Time", 
+                  command=self.plot_nodes_vs_time).pack(pady=2)
+        
+        # Snapshot plotting
+        ttk.Separator(plot_frame, orient="horizontal").pack(fill="x", pady=5)
+        ttk.Label(plot_frame, text="Pipe Snapshot:").pack(anchor="w")
+        
+        snapshot_frame = ttk.Frame(plot_frame)
+        snapshot_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(snapshot_frame, text="Time index (-1 for last):").pack(side="left")
+        self.time_index_entry = ttk.Entry(snapshot_frame, width=10)
+        self.time_index_entry.pack(side="left", padx=5)
+        self.time_index_entry.insert(0, "-1")
+        
+        ttk.Button(plot_frame, text="Plot Pipe Snapshot", 
+                  command=self.plot_pipe_snapshot).pack(pady=2)
+        
+        # Animation controls
+        ttk.Separator(plot_frame, orient="horizontal").pack(fill="x", pady=5)
+        ttk.Label(plot_frame, text="Live Animation:").pack(anchor="w")
+        
+        anim_frame = ttk.Frame(plot_frame)
+        anim_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(anim_frame, text="Interval (ms):").pack(side="left")
+        self.interval_entry = ttk.Entry(anim_frame, width=10)
+        self.interval_entry.pack(side="left", padx=5)
+        self.interval_entry.insert(0, "50")
+        
+        ttk.Button(plot_frame, text="Start Live Animation", 
+                  command=self.start_animation).pack(pady=2)
+        
+        ttk.Button(plot_frame, text="Interactive Time Slider", 
+                  command=self.interactive_plot).pack(pady=2)
+        
+        # FFT Analysis controls
+        ttk.Separator(plot_frame, orient="horizontal").pack(fill="x", pady=5)
+        ttk.Label(plot_frame, text="FFT Analysis:").pack(anchor="w")
+        
+        fft_frame = ttk.Frame(plot_frame)
+        fft_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(fft_frame, text="Nodes for FFT (comma-separated):").pack(anchor="w")
+        self.fft_node_entry = ttk.Entry(fft_frame, width=30)
+        self.fft_node_entry.pack(fill="x", pady=2)
+        self.fft_node_entry.insert(0, "2")  # Default to middle node
+        
+        fft_type_frame = ttk.Frame(plot_frame)
+        fft_type_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(fft_type_frame, text="FFT analysis type:").pack(side="left")
+        self.fft_type_var = tk.StringVar(value="both")
+        ttk.Radiobutton(fft_type_frame, text="Both", variable=self.fft_type_var, 
+                       value="both").pack(side="left")
+        ttk.Radiobutton(fft_type_frame, text="Pressure", variable=self.fft_type_var, 
+                       value="pressure").pack(side="left")
+        ttk.Radiobutton(fft_type_frame, text="Mass Flow", variable=self.fft_type_var, 
+                       value="massflow").pack(side="left")
+        
+        ttk.Button(plot_frame, text="Analyze FFT", 
+                  command=self.analyze_fft).pack(pady=2)
+        
+        # Quick load recent results
+        ttk.Separator(plot_frame, orient="horizontal").pack(fill="x", pady=5)
+        ttk.Button(plot_frame, text="Quick Load Latest Results", 
+                  command=self.quick_load_latest).pack(pady=2)
+        
+        self.pressure_file = None
+        self.massflow_file = None
+    
+    def update_info_display(self, metadata):
+        """Update the information display with simulation metadata."""
+        self.info_text.config(state=tk.NORMAL)
+        self.info_text.delete(1.0, tk.END)
+        
+        if not metadata:
+            self.info_text.insert(tk.END, "No data loaded.\n\nLoad CSV files to see simulation information here.")
+        else:
+            self.info_text.insert(tk.END, "SIMULATION DATA INFO\n")
+            self.info_text.insert(tk.END, "=" * 25 + "\n\n")
+            
+            # Display metadata in a formatted way
+            for param, info in metadata.items():
+                value = info['value']
+                unit = info['unit']
+                
+                # Format the value based on type
+                if isinstance(value, float):
+                    if param == 'Time Step (dt)' or 'Time' in param:
+                        formatted_value = f"{value:.2e}"
+                    else:
+                        formatted_value = f"{value:.6g}"
+                else:
+                    formatted_value = str(value)
+                
+                # Create the display line
+                if unit:
+                    line = f"{param}:\n  {formatted_value} {unit}\n\n"
+                else:
+                    line = f"{param}:\n  {formatted_value}\n\n"
+                
+                self.info_text.insert(tk.END, line)
+            
+            # Add derived information if available
+            if hasattr(self.viewer, 'time_array') and self.viewer.time_array is not None:
+                self.info_text.insert(tk.END, "DERIVED INFO\n")
+                self.info_text.insert(tk.END, "=" * 15 + "\n\n")
+                
+                # Time step consistency check
+                if len(self.viewer.time_array) > 1:
+                    dt_calculated = self.viewer.time_array[1] - self.viewer.time_array[0]
+                    self.info_text.insert(tk.END, f"Calculated dt:\n  {dt_calculated:.2e} s\n\n")
+                    
+                    # Calculate Nyquist frequency
+                    nyquist_freq = 1 / (2 * dt_calculated)
+                    self.info_text.insert(tk.END, f"Nyquist Frequency:\n  {nyquist_freq:.3f} Hz\n\n")
+                    
+                    # Calculate frequency resolution
+                    freq_resolution = 1 / (len(self.viewer.time_array) * dt_calculated)
+                    self.info_text.insert(tk.END, f"Frequency Resolution:\n  {freq_resolution:.6f} Hz\n\n")
+                
+                # Data size information
+                data_size_mb = (self.viewer.pressure_data.nbytes + self.viewer.massflow_data.nbytes) / (1024 * 1024)
+                self.info_text.insert(tk.END, f"Data size:\n  {data_size_mb:.2f} MB\n\n")
+        
+        self.info_text.config(state=tk.DISABLED)
+    
+    def browse_pressure_file(self):
+        filename = filedialog.askopenfilename(
+            title="Select Pressure CSV File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if filename:
+            self.pressure_file = filename
+            self.pressure_file_label.config(text=f"Pressure: {os.path.basename(filename)}")
+    
+    def browse_massflow_file(self):
+        filename = filedialog.askopenfilename(
+            title="Select Mass Flow CSV File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if filename:
+            self.massflow_file = filename
+            self.massflow_file_label.config(text=f"Mass Flow: {os.path.basename(filename)}")
+    
+    def load_data(self):
+        if not self.pressure_file or not self.massflow_file:
+            messagebox.showerror("Error", "Please select both pressure and mass flow CSV files.")
+            return
+        
+        try:
+            self.viewer.load_data(self.pressure_file, self.massflow_file)
+            self.update_info_display(self.viewer.metadata)
+            messagebox.showinfo("Success", "Data loaded successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load data: {str(e)}")
+            self.update_info_display({})  # Clear info display on error
+    
+    def plot_nodes_vs_time(self):
+        if self.viewer.pressure_data is None:
+            messagebox.showerror("Error", "Please load data first.")
+            return
+        
+        try:
+            node_text = self.node_entry.get().strip()
+            if node_text:
+                node_indices = [int(x.strip()) for x in node_text.split(",")]
+            else:
+                node_indices = None
+            
+            plot_type = self.plot_type_var.get()
+            self.viewer.plot_nodes_vs_time(node_indices, plot_type)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to plot: {str(e)}")
+    
+    def plot_pipe_snapshot(self):
+        if self.viewer.pressure_data is None:
+            messagebox.showerror("Error", "Please load data first.")
+            return
+        
+        try:
+            time_index = int(self.time_index_entry.get())
+            plot_type = self.plot_type_var.get()
+            self.viewer.plot_pipe_snapshot(time_index, plot_type)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to plot: {str(e)}")
+    
+    def start_animation(self):
+        if self.viewer.pressure_data is None:
+            messagebox.showerror("Error", "Please load data first.")
+            return
+        
+        try:
+            interval = int(self.interval_entry.get())
+            self.viewer.create_live_animation(interval)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create animation: {str(e)}")
+    
+    def interactive_plot(self):
+        if self.viewer.pressure_data is None:
+            messagebox.showerror("Error", "Please load data first.")
+            return
+        
+        try:
+            self.viewer.interactive_time_selector()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create interactive plot: {str(e)}")
+    
+    def analyze_fft(self):
+        if self.viewer.pressure_data is None:
+            messagebox.showerror("Error", "Please load data first.")
+            return
+        
+        try:
+            node_text = self.fft_node_entry.get().strip()
+            if node_text:
+                node_indices = [int(x.strip()) for x in node_text.split(",")]
+            else:
+                node_indices = None
+            
+            data_type = self.fft_type_var.get()
+            results = self.viewer.plot_fft_analysis(node_indices, data_type)
+            
+            # Show results in a popup
+            result_text = "FFT Analysis Results:\n\n"
+            if results['average_pressure_freq']:
+                result_text += f"Average Pressure Dominant Frequency: {results['average_pressure_freq']:.3f} Hz\n"
+            if results['average_massflow_freq']:
+                result_text += f"Average Mass Flow Dominant Frequency: {results['average_massflow_freq']:.3f} Hz\n"
+            
+            if results['pressure_dominant_freqs']:
+                result_text += f"\nIndividual Pressure Frequencies:\n"
+                for i, freq in enumerate(results['pressure_dominant_freqs']):
+                    result_text += f"  Node {node_indices[i]}: {freq:.3f} Hz\n"
+            
+            if results['massflow_dominant_freqs']:
+                result_text += f"\nIndividual Mass Flow Frequencies:\n"
+                for i, freq in enumerate(results['massflow_dominant_freqs']):
+                    result_text += f"  Node {node_indices[i]}: {freq:.3f} Hz\n"
+            
+            messagebox.showinfo("FFT Analysis Results", result_text)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to analyze FFT: {str(e)}")
+    
+    def quick_load_latest(self):
+        """Quick load the most recent simulation results."""
+        try:
+            # Look for simulation results folders
+            sim_folders = glob.glob("simulation_results_*")
+            if not sim_folders:
+                messagebox.showerror("Error", "No simulation results folders found.")
+                return
+            
+            # Get the most recent folder
+            latest_folder = max(sim_folders, key=os.path.getctime)
+            
+            pressure_file = os.path.join(latest_folder, "pressure_results.csv")
+            massflow_file = os.path.join(latest_folder, "massflow_results.csv")
+            
+            if os.path.exists(pressure_file) and os.path.exists(massflow_file):
+                self.pressure_file = pressure_file
+                self.massflow_file = massflow_file
+                self.pressure_file_label.config(text=f"Pressure: {os.path.basename(pressure_file)}")
+                self.massflow_file_label.config(text=f"Mass Flow: {os.path.basename(massflow_file)}")
+                
+                # Auto-load the data
+                self.load_data()
+            else:
+                messagebox.showerror("Error", f"CSV files not found in {latest_folder}")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to quick load: {str(e)}")
+            self.update_info_display({})  # Clear info display on error
+    
+    def run(self):
+        self.root.mainloop()
+
+
+def main():
+    """Main function with example usage."""
+    print("Fluid Oscillation Simulation Viewer")
+    print("====================================")
+    
+    # Check for command line arguments or run GUI
+    import sys
+    
+    if len(sys.argv) == 3:
+        # Command line usage
+        pressure_csv = sys.argv[1]
+        massflow_csv = sys.argv[2]
+        
+        viewer = SimulationViewer(pressure_csv, massflow_csv)
+        
+        # Example plots
+        print("\nCreating example plots...")
+        
+        # Plot selected nodes vs time
+        viewer.plot_nodes_vs_time([0, 2, 4], 'both')
+        
+        # Plot pipe snapshot at final time
+        viewer.plot_pipe_snapshot(-1, 'both')
+        
+        # Perform FFT analysis
+        print("Performing FFT analysis...")
+        fft_results = viewer.plot_fft_analysis([0, 2, 4], 'both')
+        print(f"Average dominant frequency (pressure): {fft_results['average_pressure_freq']:.3f} Hz")
+        print(f"Average dominant frequency (mass flow): {fft_results['average_massflow_freq']:.3f} Hz")
+        
+        # Create live animation
+        print("Starting live animation...")
+        viewer.create_live_animation(interval=100)
+        
+    else:
+        # Run GUI
+        gui = SimulationViewerGUI()
+        gui.run()
+
+
+if __name__ == "__main__":
+    main()
