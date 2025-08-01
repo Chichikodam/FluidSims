@@ -72,6 +72,7 @@ class FeedSystemCriticalPath:
         self.solveMdot(self.inletPressure, self.outletPressure)
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "p":
+                component.setMdot(self.mdot)
                 dp = component.dp(currentPressure, self.mdot)
                 
                 currentPressure -= dp
@@ -88,17 +89,51 @@ class FeedSystemCriticalPath:
     def getSystemDP(self, mdot):
         comp: systemComponent
         # Implement the function to calculate the system pressure drop based on mdot
-        return sum(comp.dp(mdot=mdot, pressureIn=self.inletPressure) for comp in self.discretisedFeed if comp.type != "g")
+        return sum(comp.dp(mdot=mdot, pressureIn=self.inletPressure) for comp in self.discretisedFeed if comp.getType() != "g")
+
 
     def solveMdot(self, inletPressure: Optional[float] = None, outletPressure: Optional[float] = None):
-        self.mdot = None
         dpTarget = inletPressure - outletPressure
+        
         def dpFunc(mdot):
             # Implement the function to calculate dp based on mdot
             return self.getSystemDP(mdot) - dpTarget
-        # Use root_scalar to find the mdot that gives the desired dp
-        result = root_scalar(dpFunc, bracket=[0.001, 10], method='bisect')
-        self.mdot = result.root
+        
+        # Find a suitable bracket
+        brackets_to_try = [
+            [0.001, 10],
+            [0.0001, 1], 
+            [0.01, 100],
+            [-1, 1],
+            [-10, 10]
+        ]
+        
+        result = None
+        for bracket in brackets_to_try:
+            try:
+                # Check if the function values have opposite signs
+                f_a = dpFunc(bracket[0])
+                f_b = dpFunc(bracket[1])
+                
+                if f_a * f_b < 0:  # Opposite signs
+                    result = root_scalar(dpFunc, bracket=bracket, method='brentq')
+                    self.mdot = result.root
+                    break
+            except Exception as e:
+                continue
+        
+        if result is None:
+            # Fallback method
+            try:
+                from scipy.optimize import fsolve
+                initial_guess = dpTarget / 10000 if abs(dpTarget) > 0 else 0.01
+                solution = fsolve(dpFunc, initial_guess)
+                self.mdot = solution[0]
+            except:
+                print(f"Warning: Could not solve for system mdot. Using estimate.")
+                # Simple estimate based on pressure drop
+                self.mdot = max(0.001, dpTarget / 100000)
+
         
 
     def boundaryPopulation(self):
@@ -126,8 +161,22 @@ class FeedSystemCriticalPath:
         for i, component in enumerate(self.discretisedFeed):
             
             if component.type == "g":
+                component: ghostCell
+                if i==0:
+                    component.setuIn(self.discretisedFeed[i+1].getVelocity())
+                    component.setuOut(self.discretisedFeed[i+1].getVelocity())
+                    component.setPressureIn(self.inletPressure)
+                    component.setPressureOut(self.inletPressure)
+                elif i == len(self.discretisedFeed) - 1:
+                    component.setuIn(self.discretisedFeed[i-1].getVelocity())
+                    component.setuOut(self.discretisedFeed[i-1].getVelocity())
+                    component.setPressureIn(self.outletPressure)
+                    component.setPressureOut(self.outletPressure)
+                    component.update(self.discretisedFeed[i-1])
+                    component.solveMdot(self.discretisedFeed[i-1])
                 continue
             component: systemComponent
+            print(component.getPressureIn())
             component.solve(self.discretisedFeed[i-1].get_u_iterate(), self.discretisedFeed[i+1].getPressureIn(), self.dt)
             self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
             # Record data efficiently using preallocation
@@ -135,7 +184,16 @@ class FeedSystemCriticalPath:
                                      self.mdot_history, self.velocity_history, 
                                      self.current_iteration)
             #print(f"Component {component.getID()}, {component.get_u_iterate()} m/s, {component.getPressureIn()/1e5} bar")
-        
+        component: systemComponent
+        for i, component in enumerate(self.discretisedFeed):
+            if component.type == "g":
+                component.solveMdot(self.discretisedFeed[i+1] if i==0 else self.discretisedFeed[i-1])
+                continue
+            component.solveMdot()
+            # Record data efficiently using preallocation
+            component.record_to_arrays(self.pressure_history, self.temp_history, 
+                                     self.mdot_history, self.velocity_history, 
+                                     self.current_iteration)
         self.current_iteration += 1
 
     def write_to_csv(self, pressure_filename="pressure_data.csv", massflow_filename="massflow_data.csv", temperature_filename="temperature_results.csv", output_dir="simulation_results"):
@@ -332,40 +390,23 @@ class systemComponent:
         self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
         self.rho = self.fluid.density
         a = self.fluid.sound_speed
-        self.outletPressure = nextPressure
-        self.solveMdot(outletPressure=nextPressure)
+        self.pressureOut = nextPressure
 
-    def solveMdot(self, inletPressure: Optional[float] = None, outletPressure: Optional[float] = None):
-        if inletPressure is None:
-            inletPressure = self.pressureIn
-        if outletPressure is None:#change inlet outlet pressures, and update them when calculating pressures
-            outletPressure = self.pressureOut
-       
-        self.mdot = None  # Reset mdot before solving
-        if inletPressure is not None:
-            currentInletPres = inletPressure
-            for i, node in enumerate(self.orderedNodes):
-                node.setPressureIn(currentInletPres)
-                dp = node.dp(self.fluid, self.mdot)
-                currentInletPres -= dp
-                node.setPressureOut(currentInletPres)
-            self.outletPressure = currentInletPres
-            
-        elif outletPressure is not None:
-            total_dp = self.getFeedPathDP()      
-            inletPressure = outletPressure + total_dp
-            nodePressure = inletPressure
-            for i, node in enumerate(self.orderedNodes):
-                node.setPressureIn(nodePressure)
-                dp = node.dp(self.fluid, self.mdot)
-                nodePressure -= dp
-                node.setPressureOut(nodePressure)
-            self.inletPressure = inletPressure
-            
-        else:
-            # Should not reach here due to _check_ready, but just in case
-            raise ValueError("Neither inletPressure nor outletPressure is defined.")
 
+
+    
+
+    def dpIterate(self, mdot=None, pressureIn=None):
+        """
+        Calculate the pressure drop across the component based on the mass flow rate.
+        This method should be overridden by subclasses.
+        """
+        if mdot is None:
+            mdot = self.mdot
+        if pressureIn is None:
+            pressureIn = self.pressureIn
+        raise NotImplementedError("This method should be overridden by subclasses")
+        
 #fix mdot
     def getID(self):
         return self.id
@@ -391,6 +432,15 @@ class systemComponent:
         return self.type
     def getPressureIn(self):
         return self.pressureIn
+    def setPressureIn(self, pressureIn):
+        self.pressureIn = pressureIn
+        self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp)) if self.fluid else None
+
+    def getPressureOut(self):
+        return self.pressureOut
+    def setPressureOut(self, pressureOut):
+        self.pressureOut = pressureOut
+        self.fluid.update(Input.pressure(self.pressureOut), Input.temperature(self.temp)) if self.fluid else None
 
     def dp(self):
         raise NotImplementedError("This method should be overridden by subclasses")
@@ -398,6 +448,12 @@ class systemComponent:
     def getVelocity(self):
         raise NotImplementedError("This method should be overridden by subclasses")
     
+    def solveMdot(self):
+        """
+        Solve the mass flow rate based on the component's state.
+        This method should be overridden by subclasses.
+        """
+        raise NotImplementedError("This method should be overridden by subclasses")
     def solve(self, prevVelocity, prevPressure):
         """
         Solve the component's state based on previous velocity and pressure.
@@ -413,6 +469,7 @@ class ghostCell(systemComponent):
         self.uIn = u
         self.uOut = self.uIn
         self.u_iterate = u
+        
         # if prevComp is not None:
         #     prevComp: systemComponent
         #     prevComp.setuOut(0)
@@ -424,19 +481,33 @@ class ghostCell(systemComponent):
         """
         return self.u_iterate
 
-    def dp(self):
-        return 0 # No pressure drop in ghost cells
+    def dp(self,cell):
+        return cell.getPressureIn() - cell.getPressureOut()
     def setU(self, uIn):
         super().setuIn(uIn)
         super().setuOut(uIn)
     
+    def update(self, cell = None):
+        self.pressureIn = cell.getPressureOut()
+        self.pressureOut =self.pressureIn- self.dp(cell)
+
+
+    def solveMdot(self, cell):
+        cell: systemComponent
+        self.mdot = cell.getMdot()
+        self.pressureIn = cell.getPressureOut()
+        self.pressureOut = self.pressureIn # Default to a small value if no cell is provided
+
+
 
 class Pipe(systemComponent):
     def __init__(self, fluid: Fluid=None, length=1.0, diameter=0.1, roughness=0.0001, location=0, pos=None, pressureIn=0, pressureOut=0, temp=None, rho=None, mdot=None): 
         super().__init__(type="p", location=location, pressureIn=pressureIn, pressureOut=pressureOut, length=length, pos=pos, temp=temp, fluid=fluid, rho=rho, mdot=mdot)
         self.diameter = diameter
         self.roughness = roughness
+        self.Re: float  # Reynolds number, will be calculated later
 
+        
     def getVelocity(self):
         if self.rho is None or self.mdot is None:
             raise ValueError("Density and mass flow rate must be set before calculating velocity.")
@@ -444,7 +515,23 @@ class Pipe(systemComponent):
         self.u_iterate = self.mdot / (self.rho * area)
         return self.u_iterate
 
-    def reCalc(self):
+    def getVelocity(self, mdot=None):
+        """
+        Calculate the velocity based on the mass flow rate and density.
+        """
+        if mdot is None:
+            if self.rho is None or self.mdot is None:
+                raise ValueError("Density and mass flow rate must be set before calculating velocity.")
+            area = np.pi * (self.diameter / 2) ** 2
+            self.u_iterate = self.mdot / (self.rho * area)
+            return self.u_iterate
+        else:
+            if self.rho is None:
+                raise ValueError("Density must be set before calculating velocity.")
+            area = np.pi * (self.diameter / 2) ** 2
+            u_iterate = mdot / (self.rho * area)
+            return u_iterate
+    def reCalc(self, mdot=None):
 
 
        # print(self.pressureIn, self.temp)
@@ -452,67 +539,92 @@ class Pipe(systemComponent):
         self.rho = self.fluid.density if self.fluid else self.rho
 
         mue = self.fluid.dynamic_viscosity
-        v = self.getVelocity()
+        v = self.getVelocity(mdot=mdot) 
         Re = (self.rho * v * self.diameter) / mue
         return Re
-    
-    def reCalcDirectional(self):
+
+    def reCalcDirectional(self, mdot=None):
 
         #print(self.pressureIn, self.temp)
         self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn)) if self.fluid else None
         self.rho = self.fluid.density if self.fluid else self.rho
 
         mue = self.fluid.dynamic_viscosity
-        v = self.u_iterate
+        if mdot is not None:
+            v = self.getVelocity(mdot)
+        else:
+            v = self.u_iterate
         Re = (self.rho * v * self.diameter) / mue
         #print(f"Reynolds number: {Re}")
         return Re
 
-    def frictionFactor(self):
-        Re = self.reCalc()
-        if Re < 3000:
+    def frictionFactor(self,mdot=None):
+        Re = self.reCalc(mdot=mdot)
+        self.Re = Re  # Store the Reynolds number for later use
+        def colebrookFF(f):
+            return 1 / np.sqrt(f) + 2 * np.log10(self.roughness / (3.7 * self.diameter) + 2.51 / (self.Re * np.sqrt(f)))
+    
+        Re = abs(Re)  # Ensure Re is non-negative for the Colebrook equation
+        if abs(Re) < 3000:
             return 64 / Re
         #using lambert equations for exact solutions, rather than colebrooks equation. Gives accuracy within 
         else:
-            return root_scalar(self.colebrookFF, args = (self.roughness, self.diameter, Re), bracket=[1e-5, 1], method='bisect').root
+            return root_scalar(colebrookFF, bracket=[1e-5, 1], method='bisect').root
 
-    def frictionFactorDirectional(self):
-        Re = self.reCalcDirectional()
-        if Re < 3000:
+    def frictionFactorDirectional(self, mdot=None):
+        Re = self.reCalcDirectional(mdot=mdot)
+        def colebrookFF(f):
+            return 1 / np.sqrt(f) + 2 * np.log10(self.roughness / (3.7 * self.diameter) + 2.51 / (self.Re * np.sqrt(f)))
+    
+        self.Re = abs(Re)  # Ensure Re is non-negative for the Colebrook equation
+        if abs(Re) < 3000:
             return 64 / Re
         #using lambert equations for exact solutions, rather than colebrooks equation. Gives accuracy within 
         else:
-            return root_scalar(self.colebrookFF, args = (self.roughness, self.diameter, Re), bracket=[1e-5, 1], method='bisect').root
+            return root_scalar(colebrookFF, bracket=[1e-5, 1], method='bisect').root
 
     
-    def colebrookFF(self,f, surfaceRoughness, innerD, Re):
-        return 1 / np.sqrt(f) + 2 * np.log10(surfaceRoughness / (3.7 * innerD) + 2.51 / (Re * np.sqrt(f)))
+        def colebrookFF(f):
+            return 1 / np.sqrt(f) + 2 * np.log10(self.roughness / (3.7 * self.diameter) + 2.51 / (self.Re * np.sqrt(f)))
     
-    def darcyWeisbach(self):
-        f = self.frictionFactor()
-        v = self.getVelocity()
+    def darcyWeisbach(self, mdot=None):
+        f = self.frictionFactor(mdot=mdot)
+        v = self.getVelocity(mdot=mdot)
         return f * (self.length / self.diameter) * (self.rho * v ** 2) / 2
     
-    def darcyWeisbachDirectional(self):
-        f = self.frictionFactorDirectional()
+    def darcyWeisbachDirectional(self, mdot=None):
+        f = self.frictionFactorDirectional(mdot)
         v = self.u_iterate
         return f *(self.length/self.diameter) *(self.rho*v* abs(v))/2
     
-    
+    #pressureOut and pressureIn shud be changed 
     def dp(self, pressureIn=None, mdot=None):
         if pressureIn is not None:
             self.pressureIn = pressureIn
             self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp)) 
         if mdot is not None:
-            self.mdot = mdot
-        dp = self.darcyWeisbach()
-        self.pressureOut = self.pressureIn - dp
-        return dp
+            
+            dp=self.darcyWeisbach(mdot=mdot)
+            return dp
+        else:
+            
+            dp = self.darcyWeisbach()
+            self.pressureOut = self.pressureIn - dp
+            return dp
 
+    def dpIterate(self, mdot=None, pressureIn=None):
+        if pressureIn is not None:
+            self.pressureIn = pressureIn
+            self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp)) 
+        if mdot is not None:
+            self.mdot = mdot
+        dp = self.darcyWeisbachDirectional(mdot=self.mdot)
+
+        return dp
     
     def solve(self, prevVelocity, nextPressure,dt):
-        super().update(nextPressure=nextPressure)
-
+        self.update(nextPressure=nextPressure)
+        self.solveMdot(outletPressure=nextPressure)
         entropy = self.fluid.entropy
         self.rho = self.fluid.density
         a = self.fluid.sound_speed
@@ -526,14 +638,95 @@ class Pipe(systemComponent):
 
 
 
+    
+    def update(self, nextPressure: Optional[float] = None):
+        self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
+        self.rho = self.fluid.density
+        a = self.fluid.sound_speed
+        self.outletPressure = nextPressure
+
+    def solveMdot(self, inletPressure= None, outletPressure= None):
+        if inletPressure is None:
+            inletPressure = self.pressureIn
+        if outletPressure is None:#change inlet outlet pressures, and update them when calculating pressures
+            outletPressure = self.pressureOut
+        self.pressureIn = inletPressure  
+        self.pressureOut = outletPressure
+        self.mdot = None  # Reset mdot before solving
+        dpTarget = self.pressureIn - self.pressureOut
+
+        def dpFunc(mdot):
+            # Implement the function to calculate dp based on mdot
+            accdP = self.dpIterate(mdot=mdot) - dpTarget
+            return accdP
+        
+        # Find a suitable bracket by testing different ranges
+        # Start with small values and expand if needed
+        brackets_to_try = [
+            [-1, 1],
+            [-10, 10], 
+            
+            
+            [-0.1, 0.1],
+            [0.001, 10],
+            [-10, 0.001]
+        ]
+        
+        result = None
+        for bracket in brackets_to_try:
+            try:
+                # Check if the function values have opposite signs
+                f_a = dpFunc(bracket[0])
+                f_b = dpFunc(bracket[1])
+                print(f"Trying bracket {bracket}: f_a={f_a}, f_b={f_b}")
+                if f_a * f_b < 0:  # Opposite signs
+                    result = root_scalar(dpFunc, bracket=bracket, method='brentq')
+                    self.mdot = result.root
+                    print(f"Solved mdot: {self.mdot} for bracket {bracket}")
+                    break
+            except Exception as e:
+                print(f"Error with bracket {bracket}: {e}")
+                # Try next bracket if this one fails
+                continue
+        
+        if result is None:
+            # If no bracket works with brentq, try a different method
+            try:
+                # Try with fsolve as fallback
+                from scipy.optimize import fsolve
+                initial_guess = dpTarget / 1000 if abs(dpTarget) > 0 else 0.01  # Simple heuristic
+                solution = fsolve(dpFunc, initial_guess)
+                self.mdot = solution[0]
+            except:
+                # Last resort: set a small default value and warn
+                print(f"Warning: Could not solve for mdot in pipe {self.id}. Using default value.")
+                self.mdot = 0.001 if dpTarget > 0 else -0.001
+
+# def solveMdot(self, inletPressure= None, outletPressure= None):
+    #     if inletPressure is None:
+    #         inletPressure = self.pressureIn
+    #     if outletPressure is None:#change inlet outlet pressures, and update them when calculating pressures
+    #         outletPressure = self.pressureOut
+    #     self.inletPressure = inletPressure  
+    #     self.outletPressure = outletPressure
+    #     self.mdot = None  # Reset mdot before solving
+    #     dpTarget = self.inletPressure - self.outletPressure
+    #     def dpFunc(mdot):
+    #         # Implement the function to calculate dp based on mdot
+    #         accdP = self.dpIterate(mdot=mdot) - dpTarget
+    #         return accdP
+    #     # Use root_scalar to find the mdot that gives the desired dp
+    #     result = root_scalar(dpFunc, bracket=[-100, 100], method='brentq')
+    #     self.mdot = result.root
     def record(self):
         # Keep backward compatibility with legacy lists
         self.pressureThroughTime.append(self.pressureIn)
         self.tempThroughTime.append(self.temp)
         self.mdotThroughTime.append(self.mdot)
+        
 
 class Orifice(systemComponent):
-    def __init__(self, fluid: Fluid, OD=0.05, ID=0.04, location=0, pos=None, pressureIn=0, pressureOut=0, temp=None, rho=None, mdot=None, l=0.01):
+    def __init__(self, fluid: Fluid, OD=0.05, ID=0.04, location=0, pos=None, pressureIn=0, pressureOut=0, temp=None, rho=None, mdot=None, l=0.01, CdA=0.01):
         super().__init__(type='o', location=location, pos=pos, pressureIn=pressureIn, pressureOut=pressureOut, temp=temp, rho=rho, mdot=mdot, fluid=fluid)
         self.outerD = OD
         self.innerD = ID
