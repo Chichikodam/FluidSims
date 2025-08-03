@@ -746,7 +746,19 @@ class Orifice(systemComponent):
         return (self.mdot /(self.CdA*np.sqrt(2/self.rho)))
     
 
-    
+    def solveMdot(self):
+        targetDp = self.pressureIn - self.pressureOut
+        def dpFunc(mdot):
+            # Calculate the pressure drop based on the current mass flow rate
+            dp = self.dp(mdot=mdot)
+            return dp - targetDp
+
+        # Use root_scalar to find the mdot that gives the desired dp
+        result = root_scalar(dpFunc, bracket=[-100, 10], method='brentq')
+        self.mdot = result.root
+
+        
+
 
 
 def barA(pa):
