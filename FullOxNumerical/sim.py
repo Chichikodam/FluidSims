@@ -69,6 +69,7 @@ class FeedSystemCriticalPath:
         currentPressure = self.inletPressure
         prevComponent = None
         self.discretise()
+        self.discretisedFeed.append(Orifice(location=self.N, fluid=self.fluid, ID = 0.005,pos=self.totalPipeLength, pressureIn=self.discretisedFeed[-1].getPressureOut(), pressureOut=self.outletPressure, temp=self.initTemp, mdot=self.mdot, type="oe"))
         self.solveMdot(self.inletPressure, self.outletPressure)
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "p":
@@ -77,14 +78,20 @@ class FeedSystemCriticalPath:
                 
                 currentPressure -= dp
             elif component.type == "o":
+                component: Orifice
                 # add in shit
-                component.pressureIn = self.inletPressure
-                component.pressureOut = self.outletPressure
+                dp = component.dp(pressureIn=currentPressure, mdot=self.mdot)
+                currentPressure -= dp
+
+            elif component.type == "oe":
+                component: Orifice
+                # add in shit
+                dp = component.dp(pressureIn=currentPressure, mdot=self.mdot)
+                currentPressure -= dp
             else:
                 raise ValueError(f"Unknown component type: {component.type}")
 
-        self.discretisedFeed.insert(0, ghostCell(location=0, u=self.discretisedFeed[0].getVelocity(), pos=0, pressureIn=self.inletPressure, pressureOut=self.outletPressure, mdot=self.mdot, temp=self.initTemp))
-        self.discretisedFeed.append(ghostCell(location=self.N, prevComp=self.discretisedFeed[-1], u=0, pos=self.totalPipeLength, pressureIn=self.inletPressure, pressureOut=self.outletPressure, mdot=self.mdot))
+        self.discretisedFeed.insert(0, ghostCell(location=0, u=self.discretisedFeed[0].getVelocity(), pos=0, pressureIn=self.inletPressure, pressureOut=self.inletPressure, mdot=self.mdot, temp=self.initTemp))
         self.boundaryPopulation()
     def getSystemDP(self, mdot):
         comp: systemComponent
@@ -139,7 +146,7 @@ class FeedSystemCriticalPath:
     def boundaryPopulation(self):
         component: systemComponent
         for i, component in enumerate(self.discretisedFeed):
-            if component.type == "g":
+            if component.type == "g" or component.type == "oe":
                 continue
             cellV = component.getVelocity()
             
@@ -155,7 +162,7 @@ class FeedSystemCriticalPath:
         
 
 
-
+#something weird with setting the outlet pressure, cos the dp is 0 on the pipe jsut before the orifice.
 
     def solve(self):
         for i, component in enumerate(self.discretisedFeed):
@@ -175,20 +182,30 @@ class FeedSystemCriticalPath:
                     component.update(self.discretisedFeed[i-1])
                     component.solveMdot(self.discretisedFeed[i-1])
                 continue
-            component: systemComponent
-            print(component.getPressureIn())
-            component.solve(self.discretisedFeed[i-1].get_u_iterate(), self.discretisedFeed[i+1].getPressureIn(), self.dt)
-            self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
+            if component.type== "oe":
+                component: Orifice
+                component.solve(self.discretisedFeed[i-1].getPressureIn())
+            elif component.type == "o":
+                component: Orifice
+                component.solve(self.discretisedFeed[i-1].getPressureIn(), self.discretisedFeed[i+1])
+                self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
+            else:
+                component: systemComponent
+                print(component.getPressureIn())
+                component.solve(self.discretisedFeed[i-1].get_u_iterate(), self.discretisedFeed[i+1].getPressureIn(), self.dt)
+                self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
             # Record data efficiently using preallocation
-            component.record_to_arrays(self.pressure_history, self.temp_history, 
-                                     self.mdot_history, self.velocity_history, 
-                                     self.current_iteration)
+            # component.record_to_arrays(self.pressure_history, self.temp_history, 
+            #                          self.mdot_history, self.velocity_history, 
+            #                          self.current_iteration)
             #print(f"Component {component.getID()}, {component.get_u_iterate()} m/s, {component.getPressureIn()/1e5} bar")
         component: systemComponent
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "g":
                 component.solveMdot(self.discretisedFeed[i+1] if i==0 else self.discretisedFeed[i-1])
                 continue
+            if component.type != "oe":
+                component.setPressureOut(self.discretisedFeed[i+1].getPressureIn())
             component.solveMdot()
             # Record data efficiently using preallocation
             component.record_to_arrays(self.pressure_history, self.temp_history, 
@@ -624,7 +641,7 @@ class Pipe(systemComponent):
     
     def solve(self, prevVelocity, nextPressure,dt):
         self.update(nextPressure=nextPressure)
-        self.solveMdot(outletPressure=nextPressure)
+        #self.solveMdot(outletPressure=nextPressure)
         entropy = self.fluid.entropy
         self.rho = self.fluid.density
         a = self.fluid.sound_speed
@@ -643,7 +660,7 @@ class Pipe(systemComponent):
         self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
         self.rho = self.fluid.density
         a = self.fluid.sound_speed
-        self.outletPressure = nextPressure
+        self.pressureOut = nextPressure
 
     def solveMdot(self, inletPressure= None, outletPressure= None):
         if inletPressure is None:
@@ -726,40 +743,71 @@ class Pipe(systemComponent):
         
 
 class Orifice(systemComponent):
-    def __init__(self, fluid: Fluid, OD=0.05, ID=0.04, location=0, pos=None, pressureIn=0, pressureOut=0, temp=None, rho=None, mdot=None, l=0.01, CdA=0.01):
-        super().__init__(type='o', location=location, pos=pos, pressureIn=pressureIn, pressureOut=pressureOut, temp=temp, rho=rho, mdot=mdot, fluid=fluid)
+    def __init__(self, fluid: Fluid, OD=0.05, ID=0.04, location=0, pos=None, pressureIn=0, pressureOut=0, temp=None, rho=None, mdot=None, l=0.01, CdA=None, type='o'):
+        super().__init__(type=type, location=location, pos=pos, pressureIn=pressureIn, pressureOut=pressureOut, temp=temp, rho=rho, mdot=mdot, fluid=fluid)
         self.outerD = OD
         self.innerD = ID
         self.length = l  # Length of the orifice
         self.pressureOut = pressureOut  # Pressure at the outlet of the orifice
-        self.CdA = CdA
-        
+        self.CdA = CdA if CdA is not None else np.pi * (self.innerD / 2) ** 2 * 0.61  # Discharge coefficient area, default to 0.61 for orifices
+        self.constPOut= pressureOut  # Constant outlet pressure, can be set to a specific value
+        self.e = 1/861  # Expansion factor, default to 1/861 for oxygen
+    
+    def getVelocity(self):
+        """
+        Calculate the velocity of the fluid through the orifice based on the mass flow rate and density.
+        """
+        if self.rho is None or self.mdot is None:
+            raise ValueError("Density and mass flow rate must be set before calculating velocity.")
+        area = np.pi * (self.innerD / 2) ** 2
+        self.u_iterate = self.mdot / (self.rho * area)
+        return self.u_iterate
 
-    def dp(self, pressureIn=None, mdot=None, timestep=None):
+    def dp(self, pressureIn=None, mdot=None):
         if pressureIn is not None:
             self.pressureIn = pressureIn
         if mdot is not None:
             self.mdot = mdot
+        # update fluid state
         self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp))
         self.rho = self.fluid.density
-        area = np.pi * (self.innerD / 2) ** 2
-        return (self.mdot /(self.CdA*np.sqrt(2/self.rho)))
-    
+        # calculate pressure drop
+        dp = (self.mdot / self.CdA)**2 / (2 * self.rho)
+        
+        # check against constant outlet pressure
+        # tol = 1e-6  # tolerance for pressure drop check
+        # if abs((self.pressureIn - dp) - self.constPOut) > tol:
+        #     raise ValueError(
+        #         f"Orifice dp check failed: pressureIn - dp = {self.pressureIn - dp:.6f} Pa, "
+        #         f"constPout = {self.constPOut:.6f} Pa"
+        #     )
+        # return massflow coefficient form
+        return dp
 
-    def solveMdot(self):
+    def solveMdot(self, inletPressure=None, outletPressure=None):
+        if inletPressure is not None:
+            self.pressureIn = inletPressure
+        if outletPressure is not None:  
+            self.pressureOut = outletPressure
         targetDp = self.pressureIn - self.pressureOut
+
         def dpFunc(mdot):
             # Calculate the pressure drop based on the current mass flow rate
             dp = self.dp(mdot=mdot)
             return dp - targetDp
 
         # Use root_scalar to find the mdot that gives the desired dp
-        result = root_scalar(dpFunc, bracket=[-100, 10], method='brentq')
+        result = root_scalar(dpFunc, bracket=[-1, 10], method='brentq')
         self.mdot = result.root
 
-        
-
-
+    def solve(self, prevPressure, nextCell=None):
+        self.pressureIn = prevPressure
+        super().update()
+        self.pressureOut = self.pressureIn - self.dp()
+        self.getVelocity()
+        if nextCell is not None:
+            cell: systemComponent = nextCell
+            cell.setPressureIn(self.pressureOut)
 
 def barA(pa):
     """
