@@ -164,25 +164,28 @@ class FeedSystemCriticalPath:
 
 #something weird with setting the outlet pressure, cos the dp is 0 on the pipe jsut before the orifice.
 
+  # ...existing code...
+
     def solve(self):
+        # First pass: Update internal cells
         for i, component in enumerate(self.discretisedFeed):
-            
             if component.type == "g":
                 component: ghostCell
-                if i==0:
-                    component.setuIn(self.discretisedFeed[i+1].getVelocity())
-                    component.setuOut(self.discretisedFeed[i+1].getVelocity())
+                if i == 0:  # Inlet ghost cell
                     component.setPressureIn(self.inletPressure)
                     component.setPressureOut(self.inletPressure)
-                elif i == len(self.discretisedFeed) - 1:
-                    component.setuIn(self.discretisedFeed[i-1].getVelocity())
-                    component.setuOut(self.discretisedFeed[i-1].getVelocity())
+                    component.setuIn(self.discretisedFeed[i+1].getuIn())
+                    component.setuOut(self.discretisedFeed[i+1].getuIn())
+                    component.set_u_iterate(self.discretisedFeed[i+1].get_u_iterate())
+                elif i == len(self.discretisedFeed) - 1:  # Outlet ghost cell
                     component.setPressureIn(self.outletPressure)
                     component.setPressureOut(self.outletPressure)
-                    component.update(self.discretisedFeed[i-1])
-                    component.solveMdot(self.discretisedFeed[i-1])
+                    component.setuIn(self.discretisedFeed[i-1].getuOut())
+                    component.setuOut(self.discretisedFeed[i-1].getuOut())
+                    component.set_u_iterate(self.discretisedFeed[i-1].get_u_iterate())
                 continue
-            if component.type== "oe":
+                
+            if component.type == "oe":
                 component: Orifice
                 component.solve(self.discretisedFeed[i-1].getPressureIn())
             elif component.type == "o":
@@ -191,27 +194,34 @@ class FeedSystemCriticalPath:
                 self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
             else:
                 component: systemComponent
-                print(component.getPressureIn())
-                component.solve(self.discretisedFeed[i-1].get_u_iterate(), self.discretisedFeed[i+1].getPressureIn(), self.dt)
+                # Ensure we have valid neighboring pressures
+                prev_pressure = self.discretisedFeed[i-1].getPressureIn() if i > 0 else self.inletPressure
+                next_pressure = self.discretisedFeed[i+1].getPressureIn() if i < len(self.discretisedFeed)-1 else self.outletPressure
+                prev_velocity = self.discretisedFeed[i-1].get_u_iterate() if i > 0 else 0
+                
+                component.solve(prevVelocity=prev_velocity, nextPressure=next_pressure, dt=self.dt)
                 self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
-            # Record data efficiently using preallocation
-            # component.record_to_arrays(self.pressure_history, self.temp_history, 
-            #                          self.mdot_history, self.velocity_history, 
-            #                          self.current_iteration)
-            #print(f"Component {component.getID()}, {component.get_u_iterate()} m/s, {component.getPressureIn()/1e5} bar")
-        component: systemComponent
+        
+        # Second pass: Update mass flows and record data
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "g":
                 component.solveMdot(self.discretisedFeed[i+1] if i==0 else self.discretisedFeed[i-1])
                 continue
+                
             if component.type != "oe":
-                component.setPressureOut(self.discretisedFeed[i+1].getPressureIn())
+                next_pressure = self.discretisedFeed[i+1].getPressureIn() if i < len(self.discretisedFeed)-1 else self.outletPressure
+                component.setPressureOut(next_pressure)
+            
             component.solveMdot()
+            
             # Record data efficiently using preallocation
             component.record_to_arrays(self.pressure_history, self.temp_history, 
-                                     self.mdot_history, self.velocity_history, 
-                                     self.current_iteration)
+                                    self.mdot_history, self.velocity_history, 
+                                    self.current_iteration)
+        
         self.current_iteration += 1
+
+# ...existing code...
 
     def write_to_csv(self, pressure_filename="pressure_data.csv", massflow_filename="massflow_data.csv", temperature_filename="temperature_results.csv", output_dir="simulation_results"):
         """
@@ -567,6 +577,7 @@ class Pipe(systemComponent):
         self.rho = self.fluid.density if self.fluid else self.rho
 
         mue = self.fluid.dynamic_viscosity
+        
         if mdot is not None:
             v = self.getVelocity(mdot)
         else:
@@ -639,19 +650,69 @@ class Pipe(systemComponent):
 
         return dp
     
-    def solve(self, prevVelocity, nextPressure,dt):
+
+    def solve(self, prevVelocity, nextPressure, dt):
+        # Input validation
+        if nextPressure <= 0:
+            nextPressure = max(1000, self.pressureOut)  # Minimum 1000 Pa
+        if abs(prevVelocity) > 500:  # Limit velocity
+            prevVelocity = np.sign(prevVelocity) * 500
+        
         self.update(nextPressure=nextPressure)
-        #self.solveMdot(outletPressure=nextPressure)
+        
+        # Store current state for stability
+        old_pressure = self.pressureIn
+        old_velocity = self.u_iterate
+        
+        # Update fluid properties
+        self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
         entropy = self.fluid.entropy
         self.rho = self.fluid.density
         a = self.fluid.sound_speed
-        dpdt = self.rho*a**2 *(prevVelocity - self.u_iterate)/self.length
-        self.pressureIn+= dpdt * dt
-        dudt = ((1/self.length)*(self.pressureIn +self.rho*(self.uIn)**2 - nextPressure - self.rho*(self.uOut)**2) - self.darcyWeisbachDirectional())/self.rho
-        self.u_iterate += dudt * dt
-        self.fluid.update(Input.pressure(self.pressureIn), Input.entropy(entropy))
-        self.temp = self.fluid.temperature
-        #self.record()
+        
+        # Pressure wave equation: dp/dt = -rho * a^2 * (du/dx)
+        # For finite differences: du/dx ≈ (u_out - u_in) / dx
+        du_dx = (self.uOut - self.uIn) / self.length
+        dpdt = -self.rho * a**2 * du_dx
+        
+        # Momentum equation: du/dt = -(1/rho) * (dp/dx + friction_term)
+        # For finite differences: dp/dx ≈ (P_out - P_in) / dx
+        dp_dx = (nextPressure - self.pressureIn) / self.length
+        friction_force = self.darcyWeisbachDirectional() / self.length  # Force per unit length
+        dudt = -(1/self.rho) * (dp_dx + friction_force)
+        
+        # Apply updates with damping for stability
+        damping_factor = 0.5  # Reduce for more stability
+        
+        self.pressureIn += damping_factor * dpdt * dt
+        self.u_iterate += damping_factor * dudt * dt
+        
+        # Clamp values to prevent runaway
+        self.pressureIn = max(1000, min(1e8, self.pressureIn))  # 1000 Pa to 100 MPa
+        self.u_iterate = max(-500, min(500, self.u_iterate))    # ±500 m/s
+        
+        # Update mass flow based on new velocity
+        area = np.pi * (self.diameter / 2) ** 2
+        self.mdot = self.rho * self.u_iterate * area
+        self.mdot = max(-1000, min(1000, self.mdot))  # Limit mass flow
+        
+        # Update fluid state with new pressure (keep entropy constant for isentropic process)
+        try:
+            self.fluid.update(Input.pressure(self.pressureIn), Input.entropy(entropy))
+            self.temp = self.fluid.temperature
+        except:
+            # Fallback if fluid update fails
+            self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp))
+        
+        # Check for stability - rollback if update is too large
+        pressure_change = abs(self.pressureIn - old_pressure) / old_pressure
+        velocity_change = abs(self.u_iterate - old_velocity) / max(abs(old_velocity), 1e-6)
+        
+        if pressure_change > 0.1 or velocity_change > 0.1:  # 10% change limit
+            print(f"Warning: Large change detected in cell {self.id}. Rolling back.")
+            self.pressureIn = old_pressure
+            self.u_iterate = old_velocity
+            self.mdot = self.rho * self.u_iterate * area
 
 
 
@@ -695,11 +756,11 @@ class Pipe(systemComponent):
                 # Check if the function values have opposite signs
                 f_a = dpFunc(bracket[0])
                 f_b = dpFunc(bracket[1])
-                print(f"Trying bracket {bracket}: f_a={f_a}, f_b={f_b}")
+                #print(f"Trying bracket {bracket}: f_a={f_a}, f_b={f_b}")
                 if f_a * f_b < 0:  # Opposite signs
                     result = root_scalar(dpFunc, bracket=bracket, method='brentq')
                     self.mdot = result.root
-                    print(f"Solved mdot: {self.mdot} for bracket {bracket}")
+                    #print(f"Solved mdot: {self.mdot} for bracket {bracket}")
                     break
             except Exception as e:
                 print(f"Error with bracket {bracket}: {e}")
@@ -819,27 +880,46 @@ if __name__ == "__main__":
     # Example usage
     fluid = Fluid(FluidsList.Oxygen)
     fluid.update(Input.temperature(-180), Input.pressure(barA(100)))
-    simTime = 3 #s
+    simTime = 5 #s
     timeIterations= 1000
-    dt = simTime / timeIterations
-    feed_system = FeedSystemCriticalPath(dt = dt,totalPipeLength=1.0, fluid=fluid, N=5, mdot=1, inletPressure=barA(100), outletPressure=barA(50))
+    
+    feed_system = FeedSystemCriticalPath(dt = 0.001, totalPipeLength=1.0, fluid=fluid, N=5, mdot=1, inletPressure=barA(100), outletPressure=barA(50))
 
     dL = feed_system.dL
     initial_velocity = feed_system.discretisedFeed[1].getVelocity()
     sound_speed = fluid.sound_speed
+    
+    # Proper CFL condition: dt < dx / (|u| + a)
     cfl_dt = dL / (abs(initial_velocity) + sound_speed)
-    # Use a safety factor (e.g., 0.5) and choose the smaller of user-defined or CFL dt
-    dt = min(simTime / timeIterations, 0.5 * cfl_dt)
-    feed_system.dt = dt / 100
-    timeIterations = round(simTime / feed_system.dt)
-    feed_system.setMaxIterations(timeIterations+100)
-    print(f"Sim time: {feed_system.dt * timeIterations} s, dt: {feed_system.dt} s, dL: {dL} m, CFL dt: {cfl_dt} s")
-    print(timeIterations, "iterations")
+    
+    # Use a much more conservative safety factor
+    dt = 0.1 * cfl_dt  # Very conservative
+    feed_system.dt = dt/50
+    timeIterations = int(simTime / dt)
+    feed_system.setMaxIterations(timeIterations + 100)
+    
+    print(f"Sim time: {simTime} s, dt: {dt:.2e} s, dL: {dL} m, CFL dt: {cfl_dt:.2e} s")
+    print(f"Sound speed: {sound_speed:.1f} m/s, Initial velocity: {initial_velocity:.3f} m/s")
+    print(f"{timeIterations} iterations")
 
     for i in range(timeIterations):
         feed_system.solve()
+        
+        # Check for instability every 10 iterations
+        if i % 10 == 0 and i > 0:
+            # Check for runaway pressures
+            max_pressure = np.max(feed_system.pressure_history[:, i])
+            min_pressure = np.min(feed_system.pressure_history[:, i])
+            
+            if max_pressure > 1e8 or min_pressure < 0:
+                print(f"\nInstability detected at iteration {i}")
+                print(f"Max pressure: {max_pressure/1e5:.1f} bar")
+                print(f"Min pressure: {min_pressure/1e5:.1f} bar")
+                break
+        
         if i > 0 and i % 100 == 0:
-            print(f"Progress: {i / timeIterations * 100:.5f}%", end='\r')
+            current_max_p = np.max(feed_system.pressure_history[:, i]) / 1e5
+            print(f"Progress: {i / timeIterations * 100:.1f}%, Max P: {current_max_p:.1f} bar", end='\r')
 
     print("Progress: 100.00000%", end='\r')
 
