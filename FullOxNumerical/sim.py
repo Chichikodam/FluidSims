@@ -61,7 +61,7 @@ class FeedSystemCriticalPath:
                 pass
             else:
                 count += 1
-                pipe = Pipe(fluid=self.fluid, length=self.dL,pos=pos, location=i+1,  temp=self.initTemp, diameter=0.01)
+                pipe = Pipe(fluid=self.fluid, length=self.dL,pos=pos, location=i+1,  temp=self.initTemp, diameter=0.035)
             self.discretisedFeed.append(pipe)
 
     def populate(self):
@@ -69,7 +69,7 @@ class FeedSystemCriticalPath:
         currentPressure = self.inletPressure
         prevComponent = None
         self.discretise()
-        self.discretisedFeed.append(Orifice(location=self.N, fluid=self.fluid, ID = 0.005,pos=self.totalPipeLength, pressureIn=self.discretisedFeed[-1].getPressureOut(), pressureOut=self.outletPressure, temp=self.initTemp, mdot=self.mdot, type="oe"))
+        self.discretisedFeed.append(Orifice(location=self.N, fluid=self.fluid, ID = 0.035,pos=self.totalPipeLength, pressureIn=self.discretisedFeed[-1].getPressureOut(), pressureOut=self.outletPressure, temp=self.initTemp, mdot=self.mdot, type="oe"))
         self.solveMdot(self.inletPressure, self.outletPressure)
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "p":
@@ -810,7 +810,7 @@ class Orifice(systemComponent):
         self.innerD = ID
         self.length = l  # Length of the orifice
         self.pressureOut = pressureOut  # Pressure at the outlet of the orifice
-        self.CdA = CdA if CdA is not None else np.pi * (self.innerD / 2) ** 2 * 0.61  # Discharge coefficient area, default to 0.61 for orifices
+        self.CdA = 194e-6#if CdA is not None else np.pi * (self.innerD / 2) ** 2 * 0.61  # Discharge coefficient area, default to 0.61 for orifices
         self.constPOut= pressureOut  # Constant outlet pressure, can be set to a specific value
         self.e = 1/861  # Expansion factor, default to 1/861 for oxygen
     
@@ -858,7 +858,7 @@ class Orifice(systemComponent):
             return dp - targetDp
 
         # Use root_scalar to find the mdot that gives the desired dp
-        result = root_scalar(dpFunc, bracket=[-1, 10], method='brentq')
+        result = root_scalar(dpFunc, bracket=[-10, 100], method='brentq')
         self.mdot = result.root
 
     def solve(self, prevPressure, nextCell=None):
@@ -880,10 +880,10 @@ if __name__ == "__main__":
     # Example usage
     fluid = Fluid(FluidsList.Oxygen)
     fluid.update(Input.temperature(-180), Input.pressure(barA(100)))
-    simTime = 5 #s
+    simTime = 1 #s
     timeIterations= 1000
     
-    feed_system = FeedSystemCriticalPath(dt = 0.001, totalPipeLength=1.0, fluid=fluid, N=5, mdot=1, inletPressure=barA(100), outletPressure=barA(50))
+    feed_system = FeedSystemCriticalPath(dt = 0.001, totalPipeLength=9.0, fluid=fluid, N=10, mdot=1, inletPressure=barA(100), outletPressure=barA(80))
 
     dL = feed_system.dL
     initial_velocity = feed_system.discretisedFeed[1].getVelocity()
@@ -894,7 +894,8 @@ if __name__ == "__main__":
     
     # Use a much more conservative safety factor
     dt = 0.1 * cfl_dt  # Very conservative
-    feed_system.dt = dt/50
+    dt = dt/100
+    feed_system.dt = dt
     timeIterations = int(simTime / dt)
     feed_system.setMaxIterations(timeIterations + 100)
     
@@ -919,7 +920,7 @@ if __name__ == "__main__":
         
         if i > 0 and i % 100 == 0:
             current_max_p = np.max(feed_system.pressure_history[:, i]) / 1e5
-            print(f"Progress: {i / timeIterations * 100:.1f}%, Max P: {current_max_p:.1f} bar", end='\r')
+            print(f"Progress: {i / timeIterations * 100:.4f}%, Max P: {current_max_p:.1f} bar", end='\r')
 
     print("Progress: 100.00000%", end='\r')
 
