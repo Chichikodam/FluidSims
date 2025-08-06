@@ -45,35 +45,75 @@ class SimulationViewer:
             pressure_cols = [col for col in self.pressure_df.columns if 'Pressure' in col]
             massflow_cols = [col for col in self.massflow_df.columns if 'Massflow' in col]
             
-            # Extract cell IDs and types
+            # Extract cell IDs and types with support for orifice inlet/outlet
             self.cell_info = []
             for col in pressure_cols:
-                # Parse column name like "p_1_Pressure (Pa)"
+                # Handle different formats:
+                # Old format: "p_1_Pressure (Pa)"
+                # New orifice format: "oe_11_Pressure_In (Pa)", "oe_11_Pressure_Out (Pa)"
                 parts = col.split('_')
                 cell_type = parts[0]
-                cell_id = int(parts[1])
-                self.cell_info.append((cell_id, cell_type))
+                
+                if len(parts) >= 3 and parts[2] in ['Pressure', 'In', 'Out']:
+                    cell_id = int(parts[1])
+                    
+                    # For orifices, add both inlet and outlet as separate entries
+                    if cell_type in ['o', 'oe']:
+                        if 'In' in col:
+                            self.cell_info.append((cell_id, cell_type, 'orifice_inlet'))
+                        elif 'Out' in col:
+                            self.cell_info.append((cell_id, cell_type, 'orifice_outlet'))
+                    else:
+                        self.cell_info.append((cell_id, cell_type, 'pipe'))
+                else:
+                    # Fallback for old format
+                    try:
+                        cell_id = int(parts[1])
+                        self.cell_info.append((cell_id, cell_type, 'pipe'))
+                    except (ValueError, IndexError):
+                        continue
             
-            # Sort by cell ID
-            self.cell_info.sort(key=lambda x: x[0])
+            # Sort by cell ID, then by component type (inlet before outlet)
+            self.cell_info.sort(key=lambda x: (x[0], x[2]))
             self.cell_ids = [info[0] for info in self.cell_info]
             
             # Convert to numpy arrays for easier manipulation
             pressure_data = []
             massflow_data = []
             
-            for cell_id, cell_type in self.cell_info:
-                pressure_col = f'{cell_type}_{cell_id}_Pressure (Pa)'
-                massflow_col = f'{cell_type}_{cell_id}_Massflow (kg/s)'
+            for cell_id, cell_type, component_type in self.cell_info:
+                if component_type == 'orifice_inlet':
+                    # For orifice inlet
+                    pressure_col = f'{cell_type}_{cell_id}_Pressure_In (Pa)'
+                    massflow_col = f'{cell_type}_{cell_id}_Massflow_In (kg/s)'
+                elif component_type == 'orifice_outlet':
+                    # For orifice outlet
+                    pressure_col = f'{cell_type}_{cell_id}_Pressure_Out (Pa)'
+                    massflow_col = f'{cell_type}_{cell_id}_Massflow_Out (kg/s)'
+                else:
+                    # For pipes and other components
+                    pressure_col = f'{cell_type}_{cell_id}_Pressure (Pa)'
+                    massflow_col = f'{cell_type}_{cell_id}_Massflow (kg/s)'
                 
-                pressure_data.append(self.pressure_df[pressure_col].values)
-                massflow_data.append(self.massflow_df[massflow_col].values)
+                if pressure_col in self.pressure_df.columns:
+                    pressure_data.append(self.pressure_df[pressure_col].values)
+                else:
+                    print(f"Warning: Column {pressure_col} not found")
+                    continue
+                    
+                if massflow_col in self.massflow_df.columns:
+                    massflow_data.append(self.massflow_df[massflow_col].values)
+                else:
+                    print(f"Warning: Column {massflow_col} not found")
+                    # Use zeros as fallback
+                    massflow_data.append(np.zeros_like(self.time_array))
             
             self.pressure_data = np.array(pressure_data)  # Shape: (n_cells, n_timesteps)
             self.massflow_data = np.array(massflow_data)
             
             print(f"Loaded data: {len(self.cell_ids)} cells, {len(self.time_array)} time steps")
             print(f"Time range: {self.time_array[0]:.6f} to {self.time_array[-1]:.6f} seconds")
+            print(f"Cell types: {[info[1:] for info in self.cell_info]}")
             
         except Exception as e:
             raise Exception(f"Error loading data: {str(e)}")
@@ -133,6 +173,19 @@ class SimulationViewer:
         
         return metadata
     
+    def get_component_label(self, node_idx):
+        """Generate a descriptive label for a component."""
+        cell_id, cell_type, component_type = self.cell_info[node_idx]
+        
+        if component_type == 'pipe':
+            return f'Pipe {cell_id}'
+        elif component_type == 'orifice_inlet':
+            return f'Orifice {cell_id} (Inlet)'
+        elif component_type == 'orifice_outlet':
+            return f'Orifice {cell_id} (Outlet)'
+        else:
+            return f'Cell {cell_id}'
+    
     def plot_nodes_vs_time(self, node_indices: List[int] = None, plot_type: str = 'both'):
         """
         Plot selected nodes vs time.
@@ -159,10 +212,10 @@ class SimulationViewer:
         
         if plot_type in ['pressure', 'both']:
             for i, node_idx in enumerate(node_indices):
-                cell_id = self.cell_ids[node_idx]
                 pressure_bar = self.pressure_data[node_idx] / 1e5  # Convert to bar
+                label = self.get_component_label(node_idx)
                 ax1.plot(self.time_array, pressure_bar, color=colors[i], 
-                        label=f'Cell {cell_id}', linewidth=2)
+                        label=label, linewidth=2)
             
             ax1.set_ylabel('Pressure (bar)')
             ax1.set_title('Pressure vs Time for Selected Nodes')
@@ -172,10 +225,10 @@ class SimulationViewer:
         if plot_type in ['massflow', 'both']:
             ax_mdot = ax2 if plot_type == 'both' else ax1
             for i, node_idx in enumerate(node_indices):
-                cell_id = self.cell_ids[node_idx]
                 massflow = self.massflow_data[node_idx]
+                label = self.get_component_label(node_idx)
                 ax_mdot.plot(self.time_array, massflow, color=colors[i], 
-                           label=f'Cell {cell_id}', linewidth=2)
+                           label=label, linewidth=2)
             
             ax_mdot.set_ylabel('Mass Flow (kg/s)')
             ax_mdot.set_title('Mass Flow vs Time for Selected Nodes')
@@ -208,23 +261,52 @@ class SimulationViewer:
             fig, ax = plt.subplots(1, 1, figsize=(12, 5))
             ax1 = ax2 = ax
         
-        # Create position array (assuming uniform spacing)
+        # Create position array and labels for x-axis
         positions = np.arange(len(self.cell_ids))
+        labels = [self.get_component_label(i) for i in range(len(self.cell_ids))]
         
         if plot_type in ['pressure', 'both']:
             pressure_bar = self.pressure_data[:, time_index] / 1e5
-            ax1.plot(positions, pressure_bar, 'bo-', linewidth=2, markersize=6)
+            
+            # Plot with different markers for different component types
+            for i, (pos, pressure, label) in enumerate(zip(positions, pressure_bar, labels)):
+                _, _, component_type = self.cell_info[i]
+                if 'orifice_inlet' in component_type:
+                    ax1.plot(pos, pressure, 'go', markersize=8, label='Orifice Inlet' if i == 0 else "")
+                elif 'orifice_outlet' in component_type:
+                    ax1.plot(pos, pressure, 'ro', markersize=8, label='Orifice Outlet' if i == 0 else "")
+                else:
+                    ax1.plot(pos, pressure, 'bo', markersize=6, label='Pipe' if i == 0 else "")
+            
+            # Connect points with lines
+            ax1.plot(positions, pressure_bar, 'k-', linewidth=1, alpha=0.5)
+            
             ax1.set_ylabel('Pressure (bar)')
             ax1.set_title(f'Pressure along Pipe at t = {time_value:.6f} s')
             ax1.grid(True, alpha=0.3)
+            ax1.legend()
         
         if plot_type in ['massflow', 'both']:
             ax_mdot = ax2 if plot_type == 'both' else ax1
             massflow = self.massflow_data[:, time_index]
-            ax_mdot.plot(positions, massflow, 'ro-', linewidth=2, markersize=6)
+            
+            # Plot with different markers for different component types
+            for i, (pos, flow, label) in enumerate(zip(positions, massflow, labels)):
+                _, _, component_type = self.cell_info[i]
+                if 'orifice_inlet' in component_type:
+                    ax_mdot.plot(pos, flow, 'go', markersize=8, label='Orifice Inlet' if i == 0 else "")
+                elif 'orifice_outlet' in component_type:
+                    ax_mdot.plot(pos, flow, 'ro', markersize=8, label='Orifice Outlet' if i == 0 else "")
+                else:
+                    ax_mdot.plot(pos, flow, 'bo', markersize=6, label='Pipe' if i == 0 else "")
+            
+            # Connect points with lines
+            ax_mdot.plot(positions, massflow, 'k-', linewidth=1, alpha=0.5)
+            
             ax_mdot.set_ylabel('Mass Flow (kg/s)')
             ax_mdot.set_title(f'Mass Flow along Pipe at t = {time_value:.6f} s')
             ax_mdot.grid(True, alpha=0.3)
+            ax_mdot.legend()
         
         plt.xlabel('Node Position')
         plt.tight_layout()
@@ -260,8 +342,7 @@ class SimulationViewer:
         ax1.grid(True, alpha=0.3)
         
         ax2.set_xlim(0, len(self.cell_ids) - 1)
-        ax2.set_ylim(np.min(self.massflow_data) * 1.05, 
-                     np.max(self.massflow_data) * 1.05)
+        ax2.set_ylim(0,  np.max(self.massflow_data) * 1.05)
         ax2.set_ylabel('Mass Flow (kg/s)')
         ax2.set_xlabel('Node Position')
         ax2.grid(True, alpha=0.3)
@@ -325,6 +406,7 @@ class SimulationViewer:
         ax1.set_ylabel('Pressure (bar)')
         ax1.grid(True, alpha=0.3)
         ax2.set_ylabel('Mass Flow (kg/s)')
+        ax2.set_ylim(0,  np.max(self.massflow_data) * 1.3)
         ax2.set_xlabel('Node Position')
         ax2.grid(True, alpha=0.3)
         
@@ -437,12 +519,12 @@ class SimulationViewer:
             ax_freq = ax2 if data_type != 'both' else ax3
             
             for i, node_idx in enumerate(node_indices):
-                cell_id = self.cell_ids[node_idx]
+                label = self.get_component_label(node_idx)
                 pressure_data = self.pressure_data[node_idx] / 1e5  # Convert to bar
                 
                 # Time domain plot
                 ax_time.plot(self.time_array, pressure_data, color=colors[i], 
-                           label=f'Cell {cell_id}', linewidth=1.5)
+                           label=label, linewidth=1.5)
                 
                 # FFT analysis
                 freqs, fft_mag, dom_freq = self.calculate_fft(pressure_data, dt)
@@ -450,7 +532,7 @@ class SimulationViewer:
                 
                 # Frequency domain plot
                 ax_freq.semilogy(freqs, fft_mag, color=colors[i], 
-                               label=f'Cell {cell_id} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
+                               label=f'{label} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
                 
                 # Mark dominant frequency
                 ax_freq.axvline(dom_freq, color=colors[i], linestyle='--', alpha=0.7)
@@ -473,12 +555,12 @@ class SimulationViewer:
             ax_freq = ax2 if data_type == 'massflow' else ax4
             
             for i, node_idx in enumerate(node_indices):
-                cell_id = self.cell_ids[node_idx]
+                label = self.get_component_label(node_idx)
                 massflow_data = self.massflow_data[node_idx]
                 
                 # Time domain plot
                 ax_time.plot(self.time_array, massflow_data, color=colors[i], 
-                           label=f'Cell {cell_id}', linewidth=1.5)
+                           label=label, linewidth=1.5)
                 
                 # FFT analysis
                 freqs, fft_mag, dom_freq = self.calculate_fft(massflow_data, dt)
@@ -486,7 +568,7 @@ class SimulationViewer:
                 
                 # Frequency domain plot
                 ax_freq.semilogy(freqs, fft_mag, color=colors[i], 
-                               label=f'Cell {cell_id} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
+                               label=f'{label} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
                 
                 # Mark dominant frequency
                 ax_freq.axvline(dom_freq, color=colors[i], linestyle='--', alpha=0.7)

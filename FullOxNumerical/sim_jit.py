@@ -21,7 +21,7 @@ def friction_factor_turbulent_approx(re, roughness_ratio):
     re_abs = abs(re)
     if re_abs < 1e-10:
         return 0.0
-    return 0.25 / (np.log10(roughness_ratio / 3.7 + 5.74 / (re_abs**0.9)))**2
+    return 1.325 / (np.log((roughness_ratio / 3.7) + (5.74 / re_abs ** 0.9))) ** 2
 
 @njit
 def calculate_friction_factor(re, roughness, diameter):
@@ -97,21 +97,35 @@ class FeedSystemCriticalPath:
         self.current_iteration = 0
         
         # Pre-allocate numpy arrays for all time history data
-        self.pressure_history = np.zeros((N + 2, max_iterations))  # +2 for ghost cells
-        self.temp_history = np.zeros((N + 2, max_iterations))
-        self.mdot_history = np.zeros((N + 2, max_iterations))
-        self.velocity_history = np.zeros((N + 2, max_iterations))
-        
+        self.pressure_history = np.zeros((N + 3, max_iterations))  # +3 for ghost cells and exit orifice outlet
+        self.temp_history = np.zeros((N + 3, max_iterations))
+        self.mdot_history = np.zeros((N + 3, max_iterations))
+        self.velocity_history = np.zeros((N + 3, max_iterations))
         fluid.update(Input.temperature(-180), Input.pressure(inletPressure))
         self.initTemp = fluid.temperature
+
+        #end orifice ramping:
+        rampStartTime = 0.05  # seconds
+        rampTime = 0.1  # seconds
+        rampStartCDA = 194e-6  # Initial CdA value
+        rampEndCDA = 0  # Final CdA value
+        rampNum = np.linspace(rampStartCDA, rampEndCDA, int(rampTime / self.dt))
+        self.CdAList = []
+        for i in range(len(rampNum)):
+            self.CdAList.append((rampNum[i], i + int(rampStartTime/self.dt)))
+
+
         self.populate()
+
+
+        
 
     def setMaxIterations(self, max_iterations):
         self.max_iterations = max_iterations
-        self.pressure_history = np.zeros((self.N + 2, max_iterations))
-        self.temp_history = np.zeros((self.N + 2, max_iterations))
-        self.mdot_history = np.zeros((self.N + 2, max_iterations))
-        self.velocity_history = np.zeros((self.N + 2, max_iterations))
+        self.pressure_history = np.zeros((self.N + 3, max_iterations))
+        self.temp_history = np.zeros((self.N + 3, max_iterations))
+        self.mdot_history = np.zeros((self.N + 3, max_iterations))
+        self.velocity_history = np.zeros((self.N + 3, max_iterations))
 
     def discretise(self):
         self.discretisedFeed = []
@@ -134,17 +148,17 @@ class FeedSystemCriticalPath:
             else:
                 count += 1
                 pipe = PipeJIT(fluid=self.fluid, length=self.dL, mdot=self.mdot, pos=pos, 
-                              location=i+1, temp=self.initTemp, diameter=0.01)
+                              location=i+1, temp=self.initTemp, diameter=0.035)
             self.discretisedFeed.append(pipe)
 
     def populate(self):
         currentPressure = self.inletPressure
         self.discretise()
-        self.discretisedFeed.append(OrificeJIT(location=self.N, fluid=self.fluid, ID=0.035, pos=self.totalPipeLength, 
+        self.discretisedFeed.append(OrificeJIT(location=self.N+1, CdA=self.CdAList,fluid=self.fluid, ID=0.035, pos=self.totalPipeLength, 
                                               pressureIn=self.discretisedFeed[-1].getPressureOut(), 
                                               pressureOut=self.outletPressure, temp=self.initTemp, mdot=self.mdot, type="oe"))
         self.solveMdot(self.inletPressure, self.outletPressure)
-        
+        print(self.mdot)
         # Initialize pressures properly with steady-state pressure drop
         for i, component in enumerate(self.discretisedFeed):
             if component.type == "p":
@@ -177,7 +191,7 @@ class FeedSystemCriticalPath:
         
         def dpFunc(mdot):
             return self.getSystemDP(mdot) - dpTarget
-        
+    
         brackets_to_try = [[0.001, 10], [0.0001, 1], [0.01, 100], [-1, 1], [-10, 10]]
         
         result = None
@@ -192,9 +206,10 @@ class FeedSystemCriticalPath:
         if result is None:
             try:
                 result = fsolve(dpFunc, 1.0)[0]
+
                 self.mdot = result
             except:
-                self.mdot = 1.0
+                raise ValueError("Failed to solve for mass flow rate with any method.")
 
     def boundaryPopulation(self):
         for i, component in enumerate(self.discretisedFeed):
@@ -215,7 +230,7 @@ class FeedSystemCriticalPath:
         """Optimized solve method using JIT where possible"""
         # Enforce boundary conditions first
         self.discretisedFeed[0].setPressureIn(self.inletPressure)  # Inlet ghost cell
-        self.discretisedFeed[-1].setPressureIn(self.outletPressure)  # Outlet ghost cell/orifice
+        #self.discretisedFeed[-1].setPressureIn(self.outletPressure)  # Outlet ghost cell/orifice
         
         # First pass: Update internal cells
         for i, component in enumerate(self.discretisedFeed):
@@ -237,12 +252,12 @@ class FeedSystemCriticalPath:
                 
             if component.type == "oe":
                 component: OrificeJIT
-                component.solve(self.discretisedFeed[i-1].getPressureIn())
+                component.solve(self.discretisedFeed[i-1].getPressureOut())
                 # Enforce outlet pressure for exit orifice
-                component.pressureOut = self.outletPressure
+                #component.pressureOut = self.outletPressure
             elif component.type == "o":
                 component: OrificeJIT
-                component.solve(self.discretisedFeed[i-1].getPressureIn(), self.discretisedFeed[i+1])
+                component.solve(self.discretisedFeed[i-1].getPressureOut(), self.discretisedFeed[i+1])
                 self.upWinding(component, self.discretisedFeed[i-1], self.discretisedFeed[i+1])
             else:
                 component: PipeJIT
@@ -258,9 +273,11 @@ class FeedSystemCriticalPath:
             if component.type == "g":
                 continue
                 
-            if component.type != "oe":
-                pass  # Skip mass flow solving for now to see pressure behavior
-            
+            if component.type == "oe":
+                component.solveMdot(inletPressure=self.discretisedFeed[i-1].getPressureOut())
+            else:
+                next_pressure = self.discretisedFeed[i+1].getPressureIn()
+                component.solveMdot(outletPressure=next_pressure)
             # Efficient array recording using JIT
             component.record_to_arrays_jit(self.pressure_history, self.temp_history, 
                                           self.mdot_history, self.velocity_history, 
@@ -335,13 +352,26 @@ class FeedSystemCriticalPath:
             writer.writerow([f'# Time Step (dt): {self.dt} s'])
             writer.writerow(['# Data begins below'])
             
-            header = ['Time (s)'] + [f'{cell.getType()}_{cell.getID()}_Pressure (Pa)' for cell in real_cells]
+            # Create headers with separate inlet/outlet for orifices
+            header = ['Time (s)']
+            data_indices = []  # Track which array indices to use for each column
+            
+            for cell in real_cells:
+                if cell.getType() in ['o', 'oe']:  # Orifices
+                    header.append(f'{cell.getType()}_{cell.getID()}_Pressure_In (Pa)')
+                    header.append(f'{cell.getType()}_{cell.getID()}_Pressure_Out (Pa)')
+                    data_indices.append(cell.getID())      # Inlet pressure
+                    data_indices.append(cell.getID() + 1)  # Outlet pressure
+                else:  # Pipes and other components
+                    header.append(f'{cell.getType()}_{cell.getID()}_Pressure (Pa)')
+                    data_indices.append(cell.getID())
+            
             writer.writerow(header)
             
             for i in range(self.current_iteration):
                 row = [time_array[i]]
-                for cell_id in real_cell_ids:
-                    row.append(self.pressure_history[cell_id, i])
+                for data_idx in data_indices:
+                    row.append(self.pressure_history[data_idx, i])
                 writer.writerow(row)
         
         # Write mass flow data
@@ -351,15 +381,57 @@ class FeedSystemCriticalPath:
             writer.writerow([f'# Total Iterations: {self.current_iteration}'])
             writer.writerow(['# Data begins below'])
             
-            header = ['Time (s)'] + [f'{cell.getType()}_{cell.getID()}_Massflow (kg/s)' for cell in real_cells]
+            # Create headers with separate inlet/outlet for orifices
+            header = ['Time (s)']
+            data_indices = []  # Track which array indices to use for each column
+            
+            for cell in real_cells:
+                if cell.getType() in ['o', 'oe']:  # Orifices
+                    header.append(f'{cell.getType()}_{cell.getID()}_Massflow_In (kg/s)')
+                    header.append(f'{cell.getType()}_{cell.getID()}_Massflow_Out (kg/s)')
+                    data_indices.append(cell.getID())      # Inlet massflow
+                    data_indices.append(cell.getID() + 1)  # Outlet massflow
+                else:  # Pipes and other components
+                    header.append(f'{cell.getType()}_{cell.getID()}_Massflow (kg/s)')
+                    data_indices.append(cell.getID())
+            
             writer.writerow(header)
             
             for i in range(self.current_iteration):
                 row = [time_array[i]]
-                for cell_id in real_cell_ids:
-                    row.append(self.mdot_history[cell_id, i])
+                for data_idx in data_indices:
+                    row.append(self.mdot_history[data_idx, i])
                 writer.writerow(row)
         
+        # Write temperature data
+        with open(temperature_path, 'w', newline='') as temperature_file:
+            writer = csv.writer(temperature_file)
+            writer.writerow(['# Simulation Metadata'])
+            writer.writerow([f'# Total Iterations: {self.current_iteration}'])
+            writer.writerow(['# Data begins below'])
+            
+            # Create headers with separate inlet/outlet for orifices
+            header = ['Time (s)']
+            data_indices = []  # Track which array indices to use for each column
+            
+            for cell in real_cells:
+                if cell.getType() in ['o', 'oe']:  # Orifices
+                    header.append(f'{cell.getType()}_{cell.getID()}_Temperature_In (K)')
+                    header.append(f'{cell.getType()}_{cell.getID()}_Temperature_Out (K)')
+                    data_indices.append(cell.getID())      # Inlet temperature
+                    data_indices.append(cell.getID() + 1)  # Outlet temperature
+                else:  # Pipes and other components
+                    header.append(f'{cell.getType()}_{cell.getID()}_Temperature (K)')
+                    data_indices.append(cell.getID())
+            
+            writer.writerow(header)
+            
+            for i in range(self.current_iteration):
+                row = [time_array[i]]
+                for data_idx in data_indices:
+                    row.append(self.temp_history[data_idx, i])
+                writer.writerow(row)
+        # Print summary
         print(f"Data written to:")
         print(f"  Pressure: {pressure_path}")
         print(f"  Mass flow: {massflow_path}")
@@ -390,7 +462,7 @@ class systemComponentJIT:
         self.u_iterate = None
 
     def record_to_arrays_jit(self, pressure_history, temp_history, mdot_history, velocity_history, iteration):
-        """JIT-optimized array recording"""
+        
         if self.id is not None:
             update_history_arrays_jit(pressure_history, temp_history, mdot_history, velocity_history,
                                      self.id, 
@@ -427,11 +499,15 @@ class systemComponentJIT:
         if self.fluid:
             self.fluid.update(Input.pressure(self.pressureOut), Input.temperature(self.temp))
 
-    def update(self, nextPressure: Optional[float] = None):
-        if self.fluid:
-            self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
-            self.rho = self.fluid.density
-        self.pressureOut = nextPressure
+    def update(self, nextPressure = None):
+        
+        self.fluid.update(Input.temperature(self.temp), Input.pressure(self.pressureIn))
+        self.rho = self.fluid.density
+        self.viscosity = self.fluid.dynamic_viscosity
+
+        
+        if nextPressure:
+            self.pressureOut = nextPressure
 
     def record(self):
         self.pressureThroughTime.append(self.pressureIn)
@@ -524,6 +600,9 @@ class PipeJIT(systemComponentJIT):
             try:
                 self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp))
                 self.temp = self.fluid.temperature
+                self.rho = self.fluid.density
+                self.viscosity = self.fluid.dynamic_viscosity   
+
             except:
                 pass
 
@@ -532,7 +611,7 @@ class PipeJIT(systemComponentJIT):
     def _solve_numerical_jit(pressure_in, velocity, next_pressure, rho, sound_speed, 
                            viscosity, u_out, u_in, length, diameter, roughness, dt):
         """JIT-compiled numerical solver for pipe"""
-        damping_factor = 0.5
+        damping_factor = 0
         
         # Calculate derivatives
         du_dx = (u_out - u_in) / length
@@ -558,8 +637,8 @@ class PipeJIT(systemComponentJIT):
         new_velocity = velocity + damping_factor * dudt * dt
         
         # Clamp values using JIT function
-        new_pressure = clamp_value(new_pressure, 1000.0, 1e8)
-        new_velocity = clamp_value(new_velocity, -500.0, 500.0)
+        #new_pressure = clamp_value(new_pressure, 1000.0, 1e8)
+        #new_velocity = clamp_value(new_velocity, -500.0, 500.0)
         
         # Calculate mass flow
         area = np.pi * (diameter / 2)**2
@@ -569,17 +648,15 @@ class PipeJIT(systemComponentJIT):
         return new_pressure, new_velocity, new_mdot
 
     def dp(self, pressureIn=None, mdot=None):
-        if pressureIn is not None:
-            self.pressureIn = pressureIn
-            if self.fluid:
-                self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp))
-        
-        if mdot is not None:
-            self.mdot = mdot
-        else:
-            mdot = self.mdot
-            
+        if pressureIn is None:
+            pressureIn = self.pressureIn
+      
+        if mdot is None:
+            mdot= self.mdot
+
+        self.mdot = mdot    
         if self.fluid:
+            self.fluid.update(Input.pressure(pressureIn), Input.temperature(self.temp))
             self.rho = self.fluid.density
             viscosity = self.fluid.dynamic_viscosity
         else:
@@ -596,10 +673,8 @@ class PipeJIT(systemComponentJIT):
             inletPressure = self.pressureIn
         if outletPressure is None:
             outletPressure = self.pressureOut
-            
-        self.pressureIn = inletPressure  
-        self.pressureOut = outletPressure
-        dpTarget = self.pressureIn - self.pressureOut
+
+        dpTarget = inletPressure - outletPressure
 
         def dpFunc(mdot):
             return self.dp(mdot=mdot) - dpTarget
@@ -632,9 +707,16 @@ class OrificeJIT(systemComponentJIT):
         self.innerD = ID
         self.length = l
         self.pressureOut = pressureOut
-        self.CdA = 194e-6 if CdA is None else CdA
+        self.dynamic = False if CdA is None else True
+        self.CdAList = [194e-6, 0] if CdA is None else CdA
+        self.CdA = self.CdAList[0][0]
+        self.iteration = 0
         self.constPOut = pressureOut
         self.e = 1/861
+        if self.dynamic:
+            self.CdA_dict = {iter_index: cdA_value for cdA_value, iter_index in self.CdAList}
+        else:
+            self.CdA_dict = {}
     
     def getVelocity(self):
         if self.rho is None or self.mdot is None:
@@ -644,25 +726,25 @@ class OrificeJIT(systemComponentJIT):
         return self.u_iterate
 
     def dp(self, pressureIn=None, mdot=None):
-        if pressureIn is not None:
-            self.pressureIn = pressureIn
+        if pressureIn is None:
+            pressureIn = self.pressureIn
         if mdot is not None:
             self.mdot = mdot
             
         if self.fluid:
-            self.fluid.update(Input.pressure(self.pressureIn), Input.temperature(self.temp))
+            self.fluid.update(Input.pressure(pressureIn), Input.temperature(self.temp))
             self.rho = self.fluid.density
         
         # Use JIT-compiled orifice calculation
         return orifice_dp_jit(self.mdot, self.CdA, self.rho)
 
     def solveMdot(self, inletPressure=None, outletPressure=None):
-        if inletPressure is not None:
-            self.pressureIn = inletPressure
-        if outletPressure is not None:  
-            self.pressureOut = outletPressure
-            
-        targetDp = self.pressureIn - self.pressureOut
+        if inletPressure is None:
+            inletPressure = self.pressureIn
+        if outletPressure is None:
+            outletPressure = self.pressureOut
+
+        targetDp = inletPressure - outletPressure
 
         def dpFunc(mdot):
             return self.dp(mdot=mdot) - targetDp
@@ -678,9 +760,34 @@ class OrificeJIT(systemComponentJIT):
         self.update()
         self.pressureOut = self.pressureIn - self.dp()
         self.getVelocity()
+        if self.dynamic:
+            self.iteration += 1
+            # O(1) dictionary lookup instead of O(n) list search
+            if self.iteration in self.CdA_dict:
+                self.CdA = self.CdA_dict[self.iteration]
+
         if nextCell is not None:
             nextCell.setPressureIn(self.pressureOut)
-
+    
+    def record_to_arrays_jit(self, pressure_history, temp_history, mdot_history, velocity_history, iteration):
+        """Record both inlet and outlet pressures for orifices"""
+        if self.id is not None:
+            # Record inlet pressure at self.id
+            update_history_arrays_jit(pressure_history, temp_history, mdot_history, velocity_history,
+                                     self.id, 
+                                     self.pressureIn if self.pressureIn is not None else 0,
+                                     self.temp if self.temp is not None else 0,
+                                     self.mdot if self.mdot is not None else 0,
+                                     self.u_iterate if self.u_iterate is not None else 0,
+                                     iteration)
+            # Record outlet pressure at self.id + 1
+            update_history_arrays_jit(pressure_history, temp_history, mdot_history, velocity_history,
+                                     self.id + 1, 
+                                     self.pressureOut if self.pressureOut is not None else 0,
+                                     self.temp if self.temp is not None else 0,
+                                     self.mdot if self.mdot is not None else 0,
+                                     self.u_iterate if self.u_iterate is not None else 0,
+                                     iteration)
 
 def barA(pa):
     """Convert pressure from bar to Pascals."""
@@ -694,7 +801,7 @@ if __name__ == "__main__":
     # Example usage with JIT optimization
     fluid = Fluid(FluidsList.Oxygen)
     fluid.update(Input.temperature(-180), Input.pressure(barA(100)))
-    simTime = 1  # s
+    simTime = 0.5 # s
     timeIterations = 1000
     
     feed_system = FeedSystemCriticalPath(dt=0.001, totalPipeLength=9.0, fluid=fluid, N=10, mdot=1, 
@@ -748,11 +855,11 @@ if __name__ == "__main__":
             print(f"Progress: {progress:.1f}% - Elapsed: {elapsed:.1f}s - Remaining: {remaining:.1f}s", end ='\r')
             
         # Print pressure distribution every 1000 iterations for debugging
-        if i > 0 and i % 1000 == 0:
-            print(f"\nIteration {i} pressure distribution:")
-            for j, comp in enumerate(feed_system.discretisedFeed):
-                if comp.type != 'g':
-                    print(f"  {comp.type}_{comp.getID()}: {comp.getPressureIn()/1e5:.3f} bar")
+        # if i > 0 and i % 1000 == 0:
+        #     print(f"\nIteration {i} pressure distribution:")
+        #     for j, comp in enumerate(feed_system.discretisedFeed):
+        #         if comp.type != 'g':
+        #             print(f"  {comp.type}_{comp.getID()}: {comp.getPressureIn()/1e5:.3f} bar")
 
     end_time = time_module.time()
     total_time = end_time - start_time
