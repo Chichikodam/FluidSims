@@ -95,7 +95,7 @@ class FeedSystemCriticalPath:
         self.dt = dt
         self.max_iterations = max_iterations
         self.current_iteration = 0
-        
+        self.rampStartCDA = 194e-6  # Initial CdA value
         # Pre-allocate numpy arrays for all time history data
         self.pressure_history = np.zeros((N + 3, max_iterations))  # +3 for ghost cells and exit orifice outlet
         self.temp_history = np.zeros((N + 3, max_iterations))
@@ -103,19 +103,21 @@ class FeedSystemCriticalPath:
         self.velocity_history = np.zeros((N + 3, max_iterations))
         fluid.update(Input.temperature(-180), Input.pressure(inletPressure))
         self.initTemp = fluid.temperature
+        self.populate()
 
+    def initCont(self):
         #end orifice ramping:
         rampStartTime = 0.05  # seconds
         rampTime = 0.1  # seconds
-        rampStartCDA = 194e-6  # Initial CdA value
-        rampEndCDA = 0  # Final CdA value
+        rampStartCDA = self.rampStartCDA  # Initial CdA value
+        rampEndCDA = 50e-6  # Final CdA value
         rampNum = np.linspace(rampStartCDA, rampEndCDA, int(rampTime / self.dt))
         self.CdAList = []
         for i in range(len(rampNum)):
             self.CdAList.append((rampNum[i], i + int(rampStartTime/self.dt)))
+        self.discretisedFeed[-1].setCdAList(self.CdAList)  # Set CdA list for the exit orifice
 
-
-        self.populate()
+        
 
 
         
@@ -154,7 +156,7 @@ class FeedSystemCriticalPath:
     def populate(self):
         currentPressure = self.inletPressure
         self.discretise()
-        self.discretisedFeed.append(OrificeJIT(location=self.N+1, CdA=self.CdAList,fluid=self.fluid, ID=0.035, pos=self.totalPipeLength, 
+        self.discretisedFeed.append(OrificeJIT(location=self.N+1, CdA=self.rampStartCDA,fluid=self.fluid, ID=0.035, pos=self.totalPipeLength, 
                                               pressureIn=self.discretisedFeed[-1].getPressureOut(), 
                                               pressureOut=self.outletPressure, temp=self.initTemp, mdot=self.mdot, type="oe"))
         self.solveMdot(self.inletPressure, self.outletPressure)
@@ -254,7 +256,7 @@ class FeedSystemCriticalPath:
                 component: OrificeJIT
                 component.solve(self.discretisedFeed[i-1].getPressureOut())
                 # Enforce outlet pressure for exit orifice
-                #component.pressureOut = self.outletPressure
+                component.pressureOut = self.outletPressure
             elif component.type == "o":
                 component: OrificeJIT
                 component.solve(self.discretisedFeed[i-1].getPressureOut(), self.discretisedFeed[i+1])
@@ -611,7 +613,7 @@ class PipeJIT(systemComponentJIT):
     def _solve_numerical_jit(pressure_in, velocity, next_pressure, rho, sound_speed, 
                            viscosity, u_out, u_in, length, diameter, roughness, dt):
         """JIT-compiled numerical solver for pipe"""
-        damping_factor = 0
+        damping_factor = 1
         
         # Calculate derivatives
         du_dx = (u_out - u_in) / length
@@ -707,9 +709,9 @@ class OrificeJIT(systemComponentJIT):
         self.innerD = ID
         self.length = l
         self.pressureOut = pressureOut
-        self.dynamic = False if CdA is None else True
+        self.dynamic = False
         self.CdAList = [194e-6, 0] if CdA is None else CdA
-        self.CdA = self.CdAList[0][0]
+        self.CdA = CdA
         self.iteration = 0
         self.constPOut = pressureOut
         self.e = 1/861
@@ -718,6 +720,12 @@ class OrificeJIT(systemComponentJIT):
         else:
             self.CdA_dict = {}
     
+    def setCdAList(self, CdAList):
+        """Set the CdA list for dynamic orifices"""
+        self.CdAList = CdAList
+        self.dynamic = True
+        self.CdA_dict = {iter_index: cdA_value for cdA_value, iter_index in CdAList}
+        self.CdA = CdAList[0][0]
     def getVelocity(self):
         if self.rho is None or self.mdot is None:
             raise ValueError("Density and mass flow rate must be set before calculating velocity.")
@@ -801,7 +809,7 @@ if __name__ == "__main__":
     # Example usage with JIT optimization
     fluid = Fluid(FluidsList.Oxygen)
     fluid.update(Input.temperature(-180), Input.pressure(barA(100)))
-    simTime = 0.5 # s
+    simTime = 0.2# s
     timeIterations = 1000
     
     feed_system = FeedSystemCriticalPath(dt=0.001, totalPipeLength=9.0, fluid=fluid, N=10, mdot=1, 
@@ -816,10 +824,11 @@ if __name__ == "__main__":
     
     # Use a much more conservative safety factor
     dt = 0.1 * cfl_dt  # Very conservative
-    dt = dt/100
+    dt = dt/200
     feed_system.dt = dt
     timeIterations = int(simTime / dt)
     feed_system.setMaxIterations(timeIterations + 100)
+    feed_system.initCont()
     
     print(f"Sim time: {simTime} s, dt: {dt:.2e} s, dL: {dL} m, CFL dt: {cfl_dt:.2e} s")
     print(f"Sound speed: {sound_speed:.1f} m/s, Initial velocity: {initial_velocity:.3f} m/s")
