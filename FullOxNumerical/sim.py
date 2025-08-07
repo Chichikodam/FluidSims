@@ -284,8 +284,9 @@ class FeedSystemCriticalPath:
             component.record_to_arrays_jit(self.pressure_history, self.temp_history, 
                                           self.mdot_history, self.velocity_history, 
                                           self.current_iteration)
-        
+        self.solveMdot
         self.current_iteration += 1
+
 
     def upWinding(self, current, previous, next):
         cellV = current.get_u_iterate()
@@ -745,6 +746,8 @@ class OrificeJIT(systemComponentJIT):
         
         # Use JIT-compiled orifice calculation
         return orifice_dp_jit(self.mdot, self.CdA, self.rho)
+    
+    
 
     def solveMdot(self, inletPressure=None, outletPressure=None):
         if inletPressure is None:
@@ -761,9 +764,16 @@ class OrificeJIT(systemComponentJIT):
             result = root_scalar(dpFunc, bracket=[-10, 100], method='brentq')
             self.mdot = result.root
         except:
-            self.mdot = 1.0
+            self.mdot = 1.0  # Fallback if root finding fails
+    
+    def setMdot(self, mdot):
+        """Set mass flow rate and update pressure"""
+        self.mdot = mdot
 
-    def solve(self, prevPressure, nextCell=None):
+#add an mdot solver for itterations only that bases mdot off velocity rather than solving through pressure drop.
+#change orifice mdot so that when cda changes, it keeps same mdot initially but has a higher dp, so increases pressure in rather than reducing pressure out, since that can stay fixed.
+
+    def solve(self, prevPressure, nextCell=None, prevCell=None):
         self.pressureIn = prevPressure
         self.update()
         self.pressureOut = self.pressureIn - self.dp()
@@ -773,6 +783,8 @@ class OrificeJIT(systemComponentJIT):
             # O(1) dictionary lookup instead of O(n) list search
             if self.iteration in self.CdA_dict:
                 self.CdA = self.CdA_dict[self.iteration]
+                self.pressureIn = self.dp()+self.pressureOut
+                prevCell.setPressureOut(self.pressureOut)
 
         if nextCell is not None:
             nextCell.setPressureIn(self.pressureOut)
