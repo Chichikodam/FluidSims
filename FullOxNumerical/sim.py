@@ -104,7 +104,9 @@ class FeedSystemCriticalPath:
         fluid.update(Input.temperature(-180), Input.pressure(inletPressure))
         self.initTemp = fluid.temperature
         self.populate()
-
+    def getCDA(self):
+        return self.discretisedFeed[-1].getCDA()
+    
     def initCont(self):
         #end orifice ramping:
         rampStartTime = 0.05  # seconds
@@ -117,7 +119,7 @@ class FeedSystemCriticalPath:
             self.CdAList.append((rampNum[i], i + int(rampStartTime/self.dt)))
         self.discretisedFeed[-1].setCdAList(self.CdAList)  # Set CdA list for the exit orifice
 
-        
+    
 
 
         
@@ -195,7 +197,7 @@ class FeedSystemCriticalPath:
             return self.getSystemDP(mdot) - dpTarget
     
         brackets_to_try = [[0.001, 10], [0.0001, 1], [0.01, 100], [-1, 1], [-10, 10]]
-        
+
         result = None
         for bracket in brackets_to_try:
             try:
@@ -254,7 +256,7 @@ class FeedSystemCriticalPath:
                 
             if component.type == "oe":
                 component: OrificeJIT
-                component.solve(self.discretisedFeed[i-1].getPressureOut())
+                component.solve(self.discretisedFeed[i-1].getPressureOut(), prevCell = self.discretisedFeed[i-1])
                 # Enforce outlet pressure for exit orifice
                 component.pressureOut = self.outletPressure
             elif component.type == "o":
@@ -279,12 +281,12 @@ class FeedSystemCriticalPath:
                 component.solveMdot(inletPressure=self.discretisedFeed[i-1].getPressureOut())
             else:
                 next_pressure = self.discretisedFeed[i+1].getPressureIn()
-                component.solveMdot(outletPressure=next_pressure)
+                component.solveMdotIter()
             # Efficient array recording using JIT
             component.record_to_arrays_jit(self.pressure_history, self.temp_history, 
                                           self.mdot_history, self.velocity_history, 
                                           self.current_iteration)
-        self.solveMdot
+        self.solveMdot()
         self.current_iteration += 1
 
 
@@ -532,6 +534,7 @@ class ghostCellJIT(systemComponentJIT):
     def dp(self, cell):
         return cell.getPressureIn() - cell.getPressureOut()
     
+    
     def setU(self, uIn):
         self.setuIn(uIn)
         self.setuOut(uIn)
@@ -629,12 +632,12 @@ class PipeJIT(systemComponentJIT):
         
         # Pressure wave equation: dp/dt = -rho * a^2 * (du/dx) - friction_loss_rate
         # The friction term reduces pressure over time
-        dpdt = -rho * sound_speed * sound_speed * du_dx - friction_dp_per_length
+        dpdt = -rho * sound_speed * sound_speed * du_dx #- friction_dp_per_length
         
         # Momentum equation: du/dt = -(1/rho) * (dp/dx + friction_force_per_length)
         friction_force_per_length = friction_dp_per_length
-        dudt = -(1.0 / rho) * (dp_dx + friction_force_per_length)
-        
+        dudt = -(1.0 / rho) * (dp_dx +(rho*(u_out)**2-rho*(u_in)**2)+ friction_force_per_length)
+
         # Update with damping for stability
         new_pressure = pressure_in + damping_factor * dpdt * dt
         new_velocity = velocity + damping_factor * dudt * dt
@@ -664,13 +667,15 @@ class PipeJIT(systemComponentJIT):
             viscosity = self.fluid.dynamic_viscosity
         else:
             viscosity = 1e-3
-            
+        
         # Use JIT-compiled calculation
         velocity = mdot / (self.rho * np.pi * (self.diameter / 2) ** 2)
         re = reynolds_number_jit(self.rho, velocity, self.diameter, viscosity)
         f = calculate_friction_factor(re, self.roughness, self.diameter)
         return darcy_weisbach_jit(f, self.length, self.diameter, self.rho, velocity)
 
+    def solveMdotIter(self, inletPressure=None, outletPressure=None):
+        self.mdot = self.u_iterate* self.rho * np.pi * (self.diameter / 2) ** 2
     def solveMdot(self, inletPressure=None, outletPressure=None):
         if inletPressure is None:
             inletPressure = self.pressureIn
@@ -700,6 +705,13 @@ class PipeJIT(systemComponentJIT):
         """Fallback to JIT version"""
         self.solve_jit(prevVelocity, nextPressure, dt)
 
+    def velFromMdot(self, mdot,rho):
+        """Calculate velocity from mass flow rate"""
+        if rho is None:
+            raise ValueError("Density must be set before calculating velocity.")
+        area = np.pi * (self.diameter / 2) ** 2
+        self.uOut = mdot / (rho * area)
+        self.u_iterate = self.uOut
 
 class OrificeJIT(systemComponentJIT):
     def __init__(self, fluid: Fluid, OD=0.05, ID=0.04, location=0, pos=None, pressureIn=0, pressureOut=0, 
@@ -727,7 +739,7 @@ class OrificeJIT(systemComponentJIT):
         self.dynamic = True
         self.CdA_dict = {iter_index: cdA_value for cdA_value, iter_index in CdAList}
         self.CdA = CdAList[0][0]
-    def getVelocity(self):
+    def getVelocity(self):#not sure if this is needed or prev velocity
         if self.rho is None or self.mdot is None:
             raise ValueError("Density and mass flow rate must be set before calculating velocity.")
         area = np.pi * (self.innerD / 2) ** 2
@@ -746,8 +758,9 @@ class OrificeJIT(systemComponentJIT):
         
         # Use JIT-compiled orifice calculation
         return orifice_dp_jit(self.mdot, self.CdA, self.rho)
-    
-    
+
+    def solveMdotIter(self, inletPressure=None, outletPressure=None):
+        self.solveMdot()
 
     def solveMdot(self, inletPressure=None, outletPressure=None):
         if inletPressure is None:
@@ -770,6 +783,10 @@ class OrificeJIT(systemComponentJIT):
         """Set mass flow rate and update pressure"""
         self.mdot = mdot
 
+    def getCDA(self):
+        """Get the current CdA value"""
+        return self.CdA
+
 #add an mdot solver for itterations only that bases mdot off velocity rather than solving through pressure drop.
 #change orifice mdot so that when cda changes, it keeps same mdot initially but has a higher dp, so increases pressure in rather than reducing pressure out, since that can stay fixed.
 
@@ -783,8 +800,8 @@ class OrificeJIT(systemComponentJIT):
             # O(1) dictionary lookup instead of O(n) list search
             if self.iteration in self.CdA_dict:
                 self.CdA = self.CdA_dict[self.iteration]
-                self.pressureIn = self.dp()+self.pressureOut
-                prevCell.setPressureOut(self.pressureOut)
+                prevCell.velfromMdot(self.mdot, self.rho)
+                #self.pressureIn = self.pressureOut + self.dp(mdot=self.mdot)
 
         if nextCell is not None:
             nextCell.setPressureIn(self.pressureOut)
@@ -874,13 +891,15 @@ if __name__ == "__main__":
             estimated_total = elapsed / (i / timeIterations)
             remaining = estimated_total - elapsed
             print(f"Progress: {progress:.1f}% - Elapsed: {elapsed:.1f}s - Remaining: {remaining:.1f}s", end ='\r')
-            
+
         # Print pressure distribution every 1000 iterations for debugging
-        # if i > 0 and i % 1000 == 0:
-        #     print(f"\nIteration {i} pressure distribution:")
-        #     for j, comp in enumerate(feed_system.discretisedFeed):
-        #         if comp.type != 'g':
-        #             print(f"  {comp.type}_{comp.getID()}: {comp.getPressureIn()/1e5:.3f} bar")
+        if i > 0 and i % 1000 == 0:
+            print(f"\nIteration {i} pressure distribution:")
+            for j, comp in enumerate(feed_system.discretisedFeed):
+                if comp.type != 'g':
+                    print(f"  {comp.type}_{comp.getID()}: {comp.getPressureIn()/1e5:.3f} bar")
+
+            print(f"CdA: {feed_system.getCDA()}")
 
     end_time = time_module.time()
     total_time = end_time - start_time

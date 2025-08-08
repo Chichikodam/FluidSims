@@ -9,24 +9,101 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from scipy.fft import fft, fftfreq
 from scipy.signal import find_peaks
+import json
 
 class SimulationViewer:
-    def __init__(self, pressure_csv: str = None, massflow_csv: str = None):
+    def __init__(self, pressure_csv: str = None, massflow_csv: str = None, dark_mode: bool = False):
         """
         Initialize the simulation viewer with CSV files.
         
         Args:
             pressure_csv: Path to pressure data CSV file
             massflow_csv: Path to mass flow data CSV file
+            dark_mode: Enable dark mode for plots
         """
         self.pressure_data = None
         self.massflow_data = None
         self.time_array = None
         self.cell_ids = None
         self.cell_positions = None
+        self.dark_mode = dark_mode
+        
+        # Initialize plot theme
+        self._setup_plot_theme()
         
         if pressure_csv and massflow_csv:
             self.load_data(pressure_csv, massflow_csv)
+    
+    def _setup_plot_theme(self):
+        """Setup matplotlib theme based on dark mode setting."""
+        if self.dark_mode:
+            plt.style.use('dark_background')
+            self.colors = {
+                'background': '#2e2e2e',
+                'figure_bg': '#1e1e1e',
+                'text': '#ffffff',
+                'grid': '#404040',
+                'accent1': '#00d4aa',
+                'accent2': '#ff6b6b',
+                'accent3': '#4ecdc4',
+                'accent4': '#45b7d1',
+                'accent5': '#96ceb4',
+                'line_color': '#ffffff',
+                'marker_colors': ['#00d4aa', '#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#feca57', '#ff9ff3', '#54a0ff']
+            }
+        else:
+            plt.style.use('default')
+            self.colors = {
+                'background': '#ffffff',
+                'figure_bg': '#ffffff',
+                'text': '#000000',
+                'grid': '#cccccc',
+                'accent1': '#1f77b4',
+                'accent2': '#ff7f0e',
+                'accent3': '#2ca02c',
+                'accent4': '#d62728',
+                'accent5': '#9467bd',
+                'line_color': '#000000',
+                'marker_colors': ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+            }
+    
+    def toggle_dark_mode(self):
+        """Toggle between dark and light mode."""
+        self.dark_mode = not self.dark_mode
+        self._setup_plot_theme()
+        return self.dark_mode
+    
+    def set_dark_mode(self, enabled: bool):
+        """Set dark mode on/off."""
+        self.dark_mode = enabled
+        self._setup_plot_theme()
+    
+    def _apply_plot_style(self, fig, axes):
+        """Apply consistent styling to a matplotlib figure."""
+        if not isinstance(axes, (list, np.ndarray)):
+            axes = [axes]
+        
+        fig.patch.set_facecolor(self.colors['figure_bg'])
+        
+        for ax in axes:
+            ax.set_facecolor(self.colors['background'])
+            ax.tick_params(colors=self.colors['text'])
+            ax.xaxis.label.set_color(self.colors['text'])
+            ax.yaxis.label.set_color(self.colors['text'])
+            ax.title.set_color(self.colors['text'])
+            ax.grid(True, alpha=0.3, color=self.colors['grid'])
+            
+            # Update spine colors
+            for spine in ax.spines.values():
+                spine.set_color(self.colors['text'])
+            
+            # Update legend if present
+            legend = ax.get_legend()
+            if legend:
+                legend.get_frame().set_facecolor(self.colors['background'])
+                legend.get_frame().set_edgecolor(self.colors['text'])
+                for text in legend.get_texts():
+                    text.set_color(self.colors['text'])
     
     def load_data(self, pressure_csv: str, massflow_csv: str):
         """Load data from CSV files."""
@@ -204,22 +281,25 @@ class SimulationViewer:
         
         if plot_type == 'both':
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            axes = [ax1, ax2]
         else:
             fig, ax = plt.subplots(1, 1, figsize=(12, 6))
             ax1 = ax2 = ax
+            axes = [ax]
         
-        colors = plt.cm.viridis(np.linspace(0, 1, len(node_indices)))
+        # Use theme-appropriate colors
+        colors = self.colors['marker_colors'][:len(node_indices)]
         
         if plot_type in ['pressure', 'both']:
             for i, node_idx in enumerate(node_indices):
                 pressure_bar = self.pressure_data[node_idx] / 1e5  # Convert to bar
                 label = self.get_component_label(node_idx)
-                ax1.plot(self.time_array, pressure_bar, color=colors[i], 
+                color = colors[i % len(colors)]
+                ax1.plot(self.time_array, pressure_bar, color=color, 
                         label=label, linewidth=2)
             
             ax1.set_ylabel('Pressure (bar)')
             ax1.set_title('Pressure vs Time for Selected Nodes')
-            ax1.grid(True, alpha=0.3)
             ax1.legend()
         
         if plot_type in ['massflow', 'both']:
@@ -227,15 +307,19 @@ class SimulationViewer:
             for i, node_idx in enumerate(node_indices):
                 massflow = self.massflow_data[node_idx]
                 label = self.get_component_label(node_idx)
-                ax_mdot.plot(self.time_array, massflow, color=colors[i], 
+                color = colors[i % len(colors)]
+                ax_mdot.plot(self.time_array, massflow, color=color, 
                            label=label, linewidth=2)
             
             ax_mdot.set_ylabel('Mass Flow (kg/s)')
             ax_mdot.set_title('Mass Flow vs Time for Selected Nodes')
-            ax_mdot.grid(True, alpha=0.3)
             ax_mdot.legend()
         
         plt.xlabel('Time (s)')
+        
+        # Apply theme styling
+        self._apply_plot_style(fig, axes)
+        
         plt.tight_layout()
         plt.show()
     
@@ -257,9 +341,11 @@ class SimulationViewer:
         
         if plot_type == 'both':
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            axes = [ax1, ax2]
         else:
             fig, ax = plt.subplots(1, 1, figsize=(12, 5))
             ax1 = ax2 = ax
+            axes = [ax]
         
         # Create position array and labels for x-axis
         positions = np.arange(len(self.cell_ids))
@@ -272,18 +358,21 @@ class SimulationViewer:
             for i, (pos, pressure, label) in enumerate(zip(positions, pressure_bar, labels)):
                 _, _, component_type = self.cell_info[i]
                 if 'orifice_inlet' in component_type:
-                    ax1.plot(pos, pressure, 'go', markersize=8, label='Orifice Inlet' if i == 0 else "")
+                    ax1.plot(pos, pressure, 'o', color=self.colors['accent1'], markersize=8, 
+                            label='Orifice Inlet' if i == 0 else "")
                 elif 'orifice_outlet' in component_type:
-                    ax1.plot(pos, pressure, 'ro', markersize=8, label='Orifice Outlet' if i == 0 else "")
+                    ax1.plot(pos, pressure, 'o', color=self.colors['accent2'], markersize=8, 
+                            label='Orifice Outlet' if i == 0 else "")
                 else:
-                    ax1.plot(pos, pressure, 'bo', markersize=6, label='Pipe' if i == 0 else "")
+                    ax1.plot(pos, pressure, 'o', color=self.colors['accent3'], markersize=6, 
+                            label='Pipe' if i == 0 else "")
             
             # Connect points with lines
-            ax1.plot(positions, pressure_bar, 'k-', linewidth=1, alpha=0.5)
+            ax1.plot(positions, pressure_bar, color=self.colors['line_color'], 
+                    linewidth=1, alpha=0.7)
             
             ax1.set_ylabel('Pressure (bar)')
             ax1.set_title(f'Pressure along Pipe at t = {time_value:.6f} s')
-            ax1.grid(True, alpha=0.3)
             ax1.legend()
         
         if plot_type in ['massflow', 'both']:
@@ -294,21 +383,28 @@ class SimulationViewer:
             for i, (pos, flow, label) in enumerate(zip(positions, massflow, labels)):
                 _, _, component_type = self.cell_info[i]
                 if 'orifice_inlet' in component_type:
-                    ax_mdot.plot(pos, flow, 'go', markersize=8, label='Orifice Inlet' if i == 0 else "")
+                    ax_mdot.plot(pos, flow, 'o', color=self.colors['accent1'], markersize=8, 
+                               label='Orifice Inlet' if i == 0 else "")
                 elif 'orifice_outlet' in component_type:
-                    ax_mdot.plot(pos, flow, 'ro', markersize=8, label='Orifice Outlet' if i == 0 else "")
+                    ax_mdot.plot(pos, flow, 'o', color=self.colors['accent2'], markersize=8, 
+                               label='Orifice Outlet' if i == 0 else "")
                 else:
-                    ax_mdot.plot(pos, flow, 'bo', markersize=6, label='Pipe' if i == 0 else "")
+                    ax_mdot.plot(pos, flow, 'o', color=self.colors['accent3'], markersize=6, 
+                               label='Pipe' if i == 0 else "")
             
             # Connect points with lines
-            ax_mdot.plot(positions, massflow, 'k-', linewidth=1, alpha=0.5)
+            ax_mdot.plot(positions, massflow, color=self.colors['line_color'], 
+                        linewidth=1, alpha=0.7)
             
             ax_mdot.set_ylabel('Mass Flow (kg/s)')
             ax_mdot.set_title(f'Mass Flow along Pipe at t = {time_value:.6f} s')
-            ax_mdot.grid(True, alpha=0.3)
             ax_mdot.legend()
         
         plt.xlabel('Node Position')
+        
+        # Apply theme styling
+        self._apply_plot_style(fig, axes)
+        
         plt.tight_layout()
         plt.show()
     
@@ -330,26 +426,26 @@ class SimulationViewer:
         # Create position array
         positions = np.arange(len(self.cell_ids))
         
-        # Initialize plots
-        line1, = ax1.plot([], [], 'bo-', linewidth=2, markersize=6)
-        line2, = ax2.plot([], [], 'ro-', linewidth=2, markersize=6)
+        # Initialize plots with theme colors
+        line1, = ax1.plot([], [], 'o-', color=self.colors['accent1'], linewidth=2, markersize=6)
+        line2, = ax2.plot([], [], 'o-', color=self.colors['accent2'], linewidth=2, markersize=6)
         
         # Set up axes
         ax1.set_xlim(0, len(self.cell_ids) - 1)
         ax1.set_ylim(np.min(self.pressure_data) / 1e5 * 0.95, 
                      np.max(self.pressure_data) / 1e5 * 1.05)
         ax1.set_ylabel('Pressure (bar)')
-        ax1.grid(True, alpha=0.3)
         
         ax2.set_xlim(0, len(self.cell_ids) - 1)
         ax2.set_ylim(0,  np.max(self.massflow_data) * 1.05)
         ax2.set_ylabel('Mass Flow (kg/s)')
         ax2.set_xlabel('Node Position')
-        ax2.grid(True, alpha=0.3)
         
-        # Add time text
+        # Add time text with theme colors
         time_text = ax1.text(0.02, 0.95, '', transform=ax1.transAxes, fontsize=12,
-                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                            bbox=dict(boxstyle='round', facecolor=self.colors['background'], 
+                                    edgecolor=self.colors['text'], alpha=0.8),
+                            color=self.colors['text'])
         
         def animate(frame):
             if frame < len(self.time_array):
@@ -369,6 +465,9 @@ class SimulationViewer:
                 ax2.set_title(f'Mass Flow along Pipe (t = {self.time_array[frame]:.6f} s)')
             
             return line1, line2, time_text
+        
+        # Apply theme styling
+        self._apply_plot_style(fig, [ax1, ax2])
         
         # Create animation
         anim = FuncAnimation(fig, animate, frames=len(self.time_array), 
@@ -399,21 +498,26 @@ class SimulationViewer:
         initial_time_idx = 0
         
         line1, = ax1.plot(positions, self.pressure_data[:, initial_time_idx] / 1e5, 
-                         'bo-', linewidth=2, markersize=6)
+                         'o-', color=self.colors['accent1'], linewidth=2, markersize=6)
         line2, = ax2.plot(positions, self.massflow_data[:, initial_time_idx], 
-                         'ro-', linewidth=2, markersize=6)
+                         'o-', color=self.colors['accent2'], linewidth=2, markersize=6)
         
         ax1.set_ylabel('Pressure (bar)')
-        ax1.grid(True, alpha=0.3)
         ax2.set_ylabel('Mass Flow (kg/s)')
         ax2.set_ylim(0,  np.max(self.massflow_data) * 1.3)
         ax2.set_xlabel('Node Position')
-        ax2.grid(True, alpha=0.3)
         
-        # Add slider
+        # Add slider with theme colors
         ax_slider = plt.axes([0.1, 0.05, 0.8, 0.03])
+        if self.dark_mode:
+            ax_slider.set_facecolor(self.colors['background'])
         slider = Slider(ax_slider, 'Time Index', 0, len(self.time_array) - 1, 
                        valinit=initial_time_idx, valfmt='%d')
+        
+        # Style the slider for dark mode
+        if self.dark_mode:
+            slider.label.set_color(self.colors['text'])
+            slider.valtext.set_color(self.colors['text'])
         
         def update(val):
             time_idx = int(slider.val)
@@ -433,6 +537,9 @@ class SimulationViewer:
         
         slider.on_changed(update)
         update(initial_time_idx)  # Initial update
+        
+        # Apply theme styling
+        self._apply_plot_style(fig, [ax1, ax2])
         
         plt.show()
     
@@ -504,11 +611,14 @@ class SimulationViewer:
         
         if data_type == 'both':
             fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+            axes = [ax1, ax2, ax3, ax4]
         else:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
             ax3 = ax4 = None
+            axes = [ax1, ax2]
         
-        colors = plt.cm.viridis(np.linspace(0, 1, len(node_indices)))
+        # Use theme colors
+        colors = self.colors['marker_colors'][:len(node_indices)]
         
         dominant_freqs_pressure = []
         dominant_freqs_massflow = []
@@ -521,9 +631,10 @@ class SimulationViewer:
             for i, node_idx in enumerate(node_indices):
                 label = self.get_component_label(node_idx)
                 pressure_data = self.pressure_data[node_idx] / 1e5  # Convert to bar
+                color = colors[i % len(colors)]
                 
                 # Time domain plot
-                ax_time.plot(self.time_array, pressure_data, color=colors[i], 
+                ax_time.plot(self.time_array, pressure_data, color=color, 
                            label=label, linewidth=1.5)
                 
                 # FFT analysis
@@ -531,22 +642,20 @@ class SimulationViewer:
                 dominant_freqs_pressure.append(dom_freq)
                 
                 # Frequency domain plot
-                ax_freq.semilogy(freqs, fft_mag, color=colors[i], 
+                ax_freq.semilogy(freqs, fft_mag, color=color, 
                                label=f'{label} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
                 
                 # Mark dominant frequency
-                ax_freq.axvline(dom_freq, color=colors[i], linestyle='--', alpha=0.7)
+                ax_freq.axvline(dom_freq, color=color, linestyle='--', alpha=0.7)
             
             ax_time.set_xlabel('Time (s)')
             ax_time.set_ylabel('Pressure (bar)')
             ax_time.set_title('Pressure Time Series')
-            ax_time.grid(True, alpha=0.3)
             ax_time.legend()
             
             ax_freq.set_xlabel('Frequency (Hz)')
             ax_freq.set_ylabel('FFT Magnitude')
             ax_freq.set_title('Pressure FFT Analysis')
-            ax_freq.grid(True, alpha=0.3)
             ax_freq.legend()
         
         # Mass flow FFT analysis
@@ -557,9 +666,10 @@ class SimulationViewer:
             for i, node_idx in enumerate(node_indices):
                 label = self.get_component_label(node_idx)
                 massflow_data = self.massflow_data[node_idx]
+                color = colors[i % len(colors)]
                 
                 # Time domain plot
-                ax_time.plot(self.time_array, massflow_data, color=colors[i], 
+                ax_time.plot(self.time_array, massflow_data, color=color, 
                            label=label, linewidth=1.5)
                 
                 # FFT analysis
@@ -567,22 +677,20 @@ class SimulationViewer:
                 dominant_freqs_massflow.append(dom_freq)
                 
                 # Frequency domain plot
-                ax_freq.semilogy(freqs, fft_mag, color=colors[i], 
+                ax_freq.semilogy(freqs, fft_mag, color=color, 
                                label=f'{label} (f_dom = {dom_freq:.2f} Hz)', linewidth=1.5)
                 
                 # Mark dominant frequency
-                ax_freq.axvline(dom_freq, color=colors[i], linestyle='--', alpha=0.7)
+                ax_freq.axvline(dom_freq, color=color, linestyle='--', alpha=0.7)
             
             ax_time.set_xlabel('Time (s)')
             ax_time.set_ylabel('Mass Flow (kg/s)')
             ax_time.set_title('Mass Flow Time Series')
-            ax_time.grid(True, alpha=0.3)
             ax_time.legend()
             
             ax_freq.set_xlabel('Frequency (Hz)')
             ax_freq.set_ylabel('FFT Magnitude')
             ax_freq.set_title('Mass Flow FFT Analysis')
-            ax_freq.grid(True, alpha=0.3)
             ax_freq.legend()
         
         # Add summary text
@@ -594,15 +702,21 @@ class SimulationViewer:
             avg_freq_m = np.mean(dominant_freqs_massflow)
             summary_text += f"Mass Flow: {avg_freq_m:.2f} Hz (avg)\n"
         
-        # Add text box with summary
+        # Add text box with summary using theme colors
+        text_props = dict(boxstyle='round', facecolor=self.colors['background'], 
+                         edgecolor=self.colors['text'], alpha=0.8)
+        
         if data_type == 'both':
             fig.text(0.02, 0.98, summary_text, transform=fig.transFigure, 
-                    verticalalignment='top', fontsize=10,
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                    verticalalignment='top', fontsize=10, color=self.colors['text'],
+                    bbox=text_props)
         else:
             ax1.text(0.02, 0.98, summary_text, transform=ax1.transAxes, 
-                    verticalalignment='top', fontsize=10,
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                    verticalalignment='top', fontsize=10, color=self.colors['text'],
+                    bbox=text_props)
+        
+        # Apply theme styling
+        self._apply_plot_style(fig, axes)
         
         plt.tight_layout()
         plt.show()
@@ -620,7 +734,58 @@ class SimulationViewerGUI:
     
     def __init__(self):
         self.viewer = SimulationViewer()
+        self.dark_mode = False
+        self.theme_config_file = "viewer_theme.json"
         self.setup_gui()
+        self.load_theme_preference()
+    
+    def load_theme_preference(self):
+        """Load saved theme preference."""
+        try:
+            if os.path.exists(self.theme_config_file):
+                with open(self.theme_config_file, 'r') as f:
+                    config = json.load(f)
+                    self.dark_mode = config.get('dark_mode', False)
+                    self.dark_mode_var.set(self.dark_mode)
+                    
+                    # Only apply dark mode to plots, not GUI
+                    self.viewer.set_dark_mode(self.dark_mode)
+        except:
+            pass  # Use default theme if loading fails
+    
+    def save_theme_preference(self):
+        """Save current theme preference."""
+        try:
+            config = {'dark_mode': self.dark_mode}
+            with open(self.theme_config_file, 'w') as f:
+                json.dump(config, f)
+        except:
+            pass  # Silently fail if saving not possible
+    
+    def toggle_theme(self, apply_to_viewer=False):
+        """Toggle between light and dark theme for plots only."""
+        self.dark_mode = self.dark_mode_var.get()
+        
+        # Only apply dark mode to the viewer (plots), not the GUI
+        self.viewer.set_dark_mode(self.dark_mode)
+        
+        self.save_theme_preference()
+    
+    def refresh_widgets(self):
+        """Force refresh of all widgets to apply new theme."""
+        # Force update of the root window and all children
+        self.root.update_idletasks()
+        
+        # Recursively update all child widgets
+        def update_widget(widget):
+            try:
+                widget.update_idletasks()
+                for child in widget.winfo_children():
+                    update_widget(child)
+            except:
+                pass
+        
+        update_widget(self.root)
     
     def setup_gui(self):
         self.root = tk.Tk()
@@ -638,6 +803,16 @@ class SimulationViewerGUI:
         # Right column for plotting options
         right_frame = ttk.Frame(main_frame)
         right_frame.pack(side="right", fill="both", expand=True)
+        
+        # Theme control frame (at the top)
+        theme_frame = ttk.LabelFrame(left_frame, text="Plot Theme Settings", padding=10)
+        theme_frame.pack(fill="x", pady=(0, 10))
+        
+        self.dark_mode_var = tk.BooleanVar()
+        theme_checkbox = ttk.Checkbutton(theme_frame, text="Dark Mode Plots", 
+                                        variable=self.dark_mode_var,
+                                        command=self.toggle_theme)
+        theme_checkbox.pack(anchor="w")
         
         # File loading frame
         file_frame = ttk.LabelFrame(left_frame, text="Load Data Files", padding=10)
@@ -867,6 +1042,9 @@ class SimulationViewerGUI:
             return
         
         try:
+            # Sync dark mode with viewer
+            self.viewer.set_dark_mode(self.dark_mode)
+            
             node_text = self.node_entry.get().strip()
             if node_text:
                 node_indices = [int(x.strip()) for x in node_text.split(",")]
@@ -885,6 +1063,9 @@ class SimulationViewerGUI:
             return
         
         try:
+            # Sync dark mode with viewer
+            self.viewer.set_dark_mode(self.dark_mode)
+            
             time_index = int(self.time_index_entry.get())
             plot_type = self.plot_type_var.get()
             self.viewer.plot_pipe_snapshot(time_index, plot_type)
@@ -898,6 +1079,9 @@ class SimulationViewerGUI:
             return
         
         try:
+            # Sync dark mode with viewer
+            self.viewer.set_dark_mode(self.dark_mode)
+            
             interval = int(self.interval_entry.get())
             self.viewer.create_live_animation(interval)
             
@@ -910,6 +1094,9 @@ class SimulationViewerGUI:
             return
         
         try:
+            # Sync dark mode with viewer
+            self.viewer.set_dark_mode(self.dark_mode)
+            
             self.viewer.interactive_time_selector()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create interactive plot: {str(e)}")
@@ -920,6 +1107,9 @@ class SimulationViewerGUI:
             return
         
         try:
+            # Sync dark mode with viewer
+            self.viewer.set_dark_mode(self.dark_mode)
+            
             node_text = self.fft_node_entry.get().strip()
             if node_text:
                 node_indices = [int(x.strip()) for x in node_text.split(",")]
@@ -993,12 +1183,18 @@ def main():
     # Check for command line arguments or run GUI
     import sys
     
-    if len(sys.argv) == 3:
+    if len(sys.argv) >= 3:
         # Command line usage
         pressure_csv = sys.argv[1]
         massflow_csv = sys.argv[2]
         
-        viewer = SimulationViewer(pressure_csv, massflow_csv)
+        # Check for dark mode flag
+        dark_mode = '--dark' in sys.argv or '-d' in sys.argv
+        
+        viewer = SimulationViewer(pressure_csv, massflow_csv, dark_mode=dark_mode)
+        
+        print(f"Dark mode: {'enabled' if dark_mode else 'disabled'}")
+        print("You can toggle dark mode with viewer.toggle_dark_mode()")
         
         # Example plots
         print("\nCreating example plots...")
@@ -1021,6 +1217,8 @@ def main():
         
     else:
         # Run GUI
+        print("Starting GUI...")
+        print("Dark mode for plots can be toggled in the Plot Theme Settings section")
         gui = SimulationViewerGUI()
         gui.run()
 
