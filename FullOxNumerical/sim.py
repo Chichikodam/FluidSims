@@ -286,7 +286,9 @@ class FeedSystemCriticalPath:
             component.record_to_arrays_jit(self.pressure_history, self.temp_history, 
                                           self.mdot_history, self.velocity_history, 
                                           self.current_iteration)
-        self.solveMdot()
+        self.solveMdot(self.inletPressure, self.outletPressure)
+
+        self.discretisedFeed[-2].velfromMdot(mdot = self.mdot, rho=self.discretisedFeed[-2].getFluid().density)
         self.current_iteration += 1
 
 
@@ -486,6 +488,7 @@ class systemComponentJIT:
     def getuIn(self): return self.uIn
     def setuIn(self, uIn): self.uIn = uIn
     def getPos(self): return self.pos
+    def getFluid(self): return self.fluid
     def getuOut(self): return self.uOut
     def setuOut(self, uOut): self.uOut = uOut
     def setMdot(self, mdot): self.mdot = mdot
@@ -632,7 +635,7 @@ class PipeJIT(systemComponentJIT):
         
         # Pressure wave equation: dp/dt = -rho * a^2 * (du/dx) - friction_loss_rate
         # The friction term reduces pressure over time
-        dpdt = -rho * sound_speed * sound_speed * du_dx #- friction_dp_per_length
+        dpdt = -rho * sound_speed * sound_speed * du_dx - friction_dp_per_length
         
         # Momentum equation: du/dt = -(1/rho) * (dp/dx + friction_force_per_length)
         friction_force_per_length = friction_dp_per_length
@@ -705,10 +708,12 @@ class PipeJIT(systemComponentJIT):
         """Fallback to JIT version"""
         self.solve_jit(prevVelocity, nextPressure, dt)
 
-    def velFromMdot(self, mdot,rho):
+    def velfromMdot(self, mdot=None, rho=None):
         """Calculate velocity from mass flow rate"""
+        if mdot is None:
+            mdot = self.mdot
         if rho is None:
-            raise ValueError("Density must be set before calculating velocity.")
+            rho = self.fluid.density
         area = np.pi * (self.diameter / 2) ** 2
         self.uOut = mdot / (rho * area)
         self.u_iterate = self.uOut
@@ -800,7 +805,7 @@ class OrificeJIT(systemComponentJIT):
             # O(1) dictionary lookup instead of O(n) list search
             if self.iteration in self.CdA_dict:
                 self.CdA = self.CdA_dict[self.iteration]
-                prevCell.velfromMdot(self.mdot, self.rho)
+            prevCell.velfromMdot(self.mdot, self.rho)
                 #self.pressureIn = self.pressureOut + self.dp(mdot=self.mdot)
 
         if nextCell is not None:
